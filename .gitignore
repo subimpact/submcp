@@ -1,0 +1,18 @@
+# Binaries
+bin/
+
+# Env
+.env
+.env.*
+
+# Backups
+backups/
+
+# Fixtures (contain live upstream data)
+fixtures/raw/
+
+# Schema dump
+schema/
+
+# Go
+*.test
