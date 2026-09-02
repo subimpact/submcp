@@ -267,3 +267,247 @@ func (p *Pool) ListEndpoints(ctx context.Context) ([]Endpoint, error) {
 	}
 	return out, rows.Err()
 }
+
+// CountTools returns the total number of cached tool definitions.
+func (p *Pool) CountTools(ctx context.Context) (int, error) {
+	var n int
+	err := p.QueryRow(ctx, `SELECT count(*) FROM tools`).Scan(&n)
+	return n, err
+}
+
+// --- Admin UI repo methods ---
+
+// ListServers returns all MCP servers (admin view).
+func (p *Pool) ListServers(ctx context.Context) ([]MCPServer, error) {
+	rows, err := p.Query(ctx, `
+		SELECT uuid, name, description, type, command, args, env, url,
+		       created_at, bearer_token, user_id, error_status, headers
+		FROM mcp_servers ORDER BY created_at DESC`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var out []MCPServer
+	for rows.Next() {
+		var s MCPServer
+		if err := rows.Scan(&s.UUID, &s.Name, &s.Description, &s.Type, &s.Command,
+			&s.Args, &s.Env, &s.URL, &s.CreatedAt, &s.BearerToken, &s.UserID,
+			&s.ErrorStatus, &s.Headers); err != nil {
+			return nil, err
+		}
+		out = append(out, s)
+	}
+	return out, rows.Err()
+}
+
+// GetServer returns one server by UUID.
+func (p *Pool) GetServer(ctx context.Context, uuid string) (*MCPServer, error) {
+	row := p.QueryRow(ctx, `
+		SELECT uuid, name, description, type, command, args, env, url,
+		       created_at, bearer_token, user_id, error_status, headers
+		FROM mcp_servers WHERE uuid = $1`, uuid)
+	var s MCPServer
+	err := row.Scan(&s.UUID, &s.Name, &s.Description, &s.Type, &s.Command,
+		&s.Args, &s.Env, &s.URL, &s.CreatedAt, &s.BearerToken, &s.UserID,
+		&s.ErrorStatus, &s.Headers)
+	if err == pgx.ErrNoRows {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	return &s, nil
+}
+
+// CreateServer inserts a new MCP server.
+func (p *Pool) CreateServer(ctx context.Context, s *MCPServer) error {
+	return p.QueryRow(ctx, `
+		INSERT INTO mcp_servers (name, description, type, command, args, env, url,
+		                         bearer_token, headers)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+		RETURNING uuid, created_at`,
+		s.Name, s.Description, s.Type, s.Command, s.Args, s.Env, s.URL,
+		s.BearerToken, s.Headers).Scan(&s.UUID, &s.CreatedAt)
+}
+
+// UpdateServer updates editable fields of a server.
+func (p *Pool) UpdateServer(ctx context.Context, s *MCPServer) error {
+	_, err := p.Exec(ctx, `
+		UPDATE mcp_servers SET name = $2, description = $3, type = $4,
+		       command = $5, args = $6, env = $7, url = $8, bearer_token = $9,
+		       headers = $10
+		WHERE uuid = $1`,
+		s.UUID, s.Name, s.Description, s.Type, s.Command, s.Args, s.Env,
+		s.URL, s.BearerToken, s.Headers)
+	return err
+}
+
+// DeleteServer removes a server and its mappings (cascade handles tools).
+func (p *Pool) DeleteServer(ctx context.Context, uuid string) error {
+	_, err := p.Exec(ctx, `DELETE FROM mcp_servers WHERE uuid = $1`, uuid)
+	return err
+}
+
+// ListNamespaces returns all namespaces.
+func (p *Pool) ListNamespaces(ctx context.Context) ([]Namespace, error) {
+	rows, err := p.Query(ctx, `
+		SELECT uuid, name, description, created_at, updated_at, user_id
+		FROM namespaces ORDER BY name`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var out []Namespace
+	for rows.Next() {
+		var n Namespace
+		if err := rows.Scan(&n.UUID, &n.Name, &n.Description, &n.CreatedAt,
+			&n.UpdatedAt, &n.UserID); err != nil {
+			return nil, err
+		}
+		out = append(out, n)
+	}
+	return out, rows.Err()
+}
+
+// CreateNamespace inserts a new namespace.
+func (p *Pool) CreateNamespace(ctx context.Context, n *Namespace) error {
+	return p.QueryRow(ctx, `
+		INSERT INTO namespaces (name, description)
+		VALUES ($1, $2) RETURNING uuid, created_at, updated_at`,
+		n.Name, n.Description).Scan(&n.UUID, &n.CreatedAt, &n.UpdatedAt)
+}
+
+// DeleteNamespace removes a namespace (cascade removes mappings/endpoints).
+func (p *Pool) DeleteNamespace(ctx context.Context, uuid string) error {
+	_, err := p.Exec(ctx, `DELETE FROM namespaces WHERE uuid = $1`, uuid)
+	return err
+}
+
+// ListNamespaceServerMappings returns server mappings for a namespace.
+func (p *Pool) ListNamespaceServerMappings(ctx context.Context, namespaceUUID string) ([]NamespaceServerMapping, error) {
+	rows, err := p.Query(ctx, `
+		SELECT uuid, namespace_uuid, mcp_server_uuid, status, created_at
+		FROM namespace_server_mappings WHERE namespace_uuid = $1`, namespaceUUID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var out []NamespaceServerMapping
+	for rows.Next() {
+		var m NamespaceServerMapping
+		if err := rows.Scan(&m.UUID, &m.NamespaceUUID, &m.MCPServerUUID,
+			&m.Status, &m.CreatedAt); err != nil {
+			return nil, err
+		}
+		out = append(out, m)
+	}
+	return out, rows.Err()
+}
+
+// SetServerMapping upserts a server's status in a namespace.
+func (p *Pool) SetServerMapping(ctx context.Context, namespaceUUID, serverUUID string, status ServerStatus) error {
+	_, err := p.Exec(ctx, `
+		INSERT INTO namespace_server_mappings (namespace_uuid, mcp_server_uuid, status)
+		VALUES ($1, $2, $3)
+		ON CONFLICT (namespace_uuid, mcp_server_uuid)
+		DO UPDATE SET status = EXCLUDED.status`,
+		namespaceUUID, serverUUID, status)
+	return err
+}
+
+// ListAPIKeys returns all API keys (admin view, key values included).
+func (p *Pool) ListAPIKeys(ctx context.Context) ([]APIKey, error) {
+	rows, err := p.Query(ctx, `
+		SELECT uuid, name, key, user_id, created_at, is_active
+		FROM api_keys ORDER BY created_at DESC`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var out []APIKey
+	for rows.Next() {
+		var k APIKey
+		if err := rows.Scan(&k.UUID, &k.Name, &k.Key, &k.UserID, &k.CreatedAt,
+			&k.IsActive); err != nil {
+			return nil, err
+		}
+		out = append(out, k)
+	}
+	return out, rows.Err()
+}
+
+// CreateAPIKey inserts a new API key.
+func (p *Pool) CreateAPIKey(ctx context.Context, name, key string) (*APIKey, error) {
+	var k APIKey
+	err := p.QueryRow(ctx, `
+		INSERT INTO api_keys (name, key)
+		VALUES ($1, $2) RETURNING uuid, created_at, is_active`,
+		name, key).Scan(&k.UUID, &k.CreatedAt, &k.IsActive)
+	if err != nil {
+		return nil, err
+	}
+	k.Name = name
+	k.Key = key
+	return &k, nil
+}
+
+// SetAPIKeyActive toggles an API key's active state.
+func (p *Pool) SetAPIKeyActive(ctx context.Context, uuid string, active bool) error {
+	_, err := p.Exec(ctx, `UPDATE api_keys SET is_active = $2 WHERE uuid = $1`, uuid, active)
+	return err
+}
+
+// ListToolsByServer returns tools for a server.
+func (p *Pool) ListToolsByServer(ctx context.Context, serverUUID string) ([]Tool, error) {
+	rows, err := p.Query(ctx, `
+		SELECT uuid, name, description, tool_schema, created_at, updated_at, mcp_server_uuid
+		FROM tools WHERE mcp_server_uuid = $1 ORDER BY name`, serverUUID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var out []Tool
+	for rows.Next() {
+		var t Tool
+		if err := rows.Scan(&t.UUID, &t.Name, &t.Description, &t.ToolSchema,
+			&t.CreatedAt, &t.UpdatedAt, &t.MCPServerUUID); err != nil {
+			return nil, err
+		}
+		out = append(out, t)
+	}
+	return out, rows.Err()
+}
+
+// CreateEndpoint inserts a new endpoint.
+func (p *Pool) CreateEndpoint(ctx context.Context, e *Endpoint) error {
+	return p.QueryRow(ctx, `
+		INSERT INTO endpoints (name, description, namespace_uuid, enable_api_key_auth,
+		                       use_query_param_auth, enable_oauth)
+		VALUES ($1, $2, $3, $4, $5, $6)
+		RETURNING uuid, created_at, updated_at`,
+		e.Name, e.Description, e.NamespaceUUID, e.EnableAPIKeyAuth,
+		e.UseQueryParamAuth, e.EnableOAuth).Scan(&e.UUID, &e.CreatedAt, &e.UpdatedAt)
+}
+
+// UpdateEndpoint updates an endpoint.
+func (p *Pool) UpdateEndpoint(ctx context.Context, e *Endpoint) error {
+	_, err := p.Exec(ctx, `
+		UPDATE endpoints SET name = $2, description = $3, namespace_uuid = $4,
+		       enable_api_key_auth = $5, use_query_param_auth = $6, enable_oauth = $7,
+		       updated_at = now()
+		WHERE uuid = $1`,
+		e.UUID, e.Name, e.Description, e.NamespaceUUID, e.EnableAPIKeyAuth,
+		e.UseQueryParamAuth, e.EnableOAuth)
+	return err
+}
+
+// DeleteEndpoint removes an endpoint.
+func (p *Pool) DeleteEndpoint(ctx context.Context, uuid string) error {
+	_, err := p.Exec(ctx, `DELETE FROM endpoints WHERE uuid = $1`, uuid)
+	return err
+}

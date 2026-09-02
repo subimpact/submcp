@@ -1,0 +1,148 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>submcp admin</title>
+<link rel="stylesheet" href="/assets/style.css">
+</head>
+<body>
+<div id="app">
+  <div id="login-view" class="hidden">
+    <div class="login-card">
+      <h1>submcp</h1>
+      <p class="muted">MCP gateway admin</p>
+      <form id="login-form">
+        <input type="password" id="login-key" placeholder="API key" autocomplete="current-password" required>
+        <button type="submit">Sign in</button>
+        <p id="login-error" class="error hidden"></p>
+      </form>
+    </div>
+  </div>
+
+  <div id="main-view" class="hidden">
+    <header>
+      <div class="brand">submcp <span class="muted">admin</span></div>
+      <div class="header-right">
+        <span id="session-name" class="muted"></span>
+        <button id="logout-btn" class="ghost">Sign out</button>
+      </div>
+    </header>
+
+    <nav>
+      <button data-tab="overview" class="tab active">Overview</button>
+      <button data-tab="servers" class="tab">Servers</button>
+      <button data-tab="namespaces" class="tab">Namespaces</button>
+      <button data-tab="endpoints" class="tab">Endpoints</button>
+      <button data-tab="keys" class="tab">API keys</button>
+    </nav>
+
+    <main>
+      <section id="tab-overview" class="tab-panel">
+        <div class="stat-row" id="stat-row"></div>
+        <h2>Servers</h2>
+        <div id="overview-servers"></div>
+        <h2>Endpoints</h2>
+        <div id="overview-endpoints"></div>
+      </section>
+
+      <section id="tab-servers" class="tab-panel hidden">
+        <div class="toolbar">
+          <h2>MCP servers</h2>
+          <button id="server-new" class="primary">+ Add server</button>
+        </div>
+        <div id="servers-list"></div>
+        <div id="server-form" class="form-card hidden">
+          <h3 id="server-form-title">Add server</h3>
+          <form id="server-form-fields">
+            <label>Name <input name="name" required placeholder="e.g. peecai"></label>
+            <label>Type
+              <select name="type">
+                <option value="STREAMABLE_HTTP">STREAMABLE_HTTP</option>
+                <option value="SSE">SSE</option>
+                <option value="STDIO">STDIO</option>
+              </select>
+            </label>
+            <label>URL <input name="url" placeholder="https://api.example.com/mcp"></label>
+            <label>Bearer token <input name="bearer_token" type="password" placeholder="optional"></label>
+            <label>Description <input name="description" placeholder="optional"></label>
+            <label>Headers (JSON) <textarea name="headers" rows="2" placeholder='{"X-Custom": "value"}'></textarea></label>
+            <div class="form-actions">
+              <button type="submit" class="primary">Save</button>
+              <button type="button" id="server-form-cancel" class="ghost">Cancel</button>
+            </div>
+            <p id="server-form-error" class="error hidden"></p>
+          </form>
+        </div>
+      </section>
+
+      <section id="tab-namespaces" class="tab-panel hidden">
+        <div class="toolbar">
+          <h2>Namespaces</h2>
+          <button id="namespace-new" class="primary">+ Add namespace</button>
+        </div>
+        <div id="namespaces-list"></div>
+        <div id="namespace-form" class="form-card hidden">
+          <h3>Add namespace</h3>
+          <form id="namespace-form-fields">
+            <label>Name <input name="name" required placeholder="e.g. all"></label>
+            <label>Description <input name="description" placeholder="optional"></label>
+            <div class="form-actions">
+              <button type="submit" class="primary">Save</button>
+              <button type="button" id="namespace-form-cancel" class="ghost">Cancel</button>
+            </div>
+            <p id="namespace-form-error" class="error hidden"></p>
+          </form>
+        </div>
+      </section>
+
+      <section id="tab-endpoints" class="tab-panel hidden">
+        <div class="toolbar">
+          <h2>Endpoints</h2>
+          <button id="endpoint-new" class="primary">+ Add endpoint</button>
+        </div>
+        <div id="endpoints-list"></div>
+        <div id="endpoint-form" class="form-card hidden">
+          <h3 id="endpoint-form-title">Add endpoint</h3>
+          <form id="endpoint-form-fields">
+            <label>Name <input name="name" required placeholder="e.g. all"></label>
+            <label>Namespace
+              <select name="namespace_uuid" id="endpoint-ns-select" required></select>
+            </label>
+            <label>Description <input name="description" placeholder="optional"></label>
+            <label class="check"><input type="checkbox" name="enable_api_key_auth" checked> Require API key</label>
+            <label class="check"><input type="checkbox" name="use_query_param_auth"> Allow key via query param</label>
+            <div class="form-actions">
+              <button type="submit" class="primary">Save</button>
+              <button type="button" id="endpoint-form-cancel" class="ghost">Cancel</button>
+            </div>
+            <p id="endpoint-form-error" class="error hidden"></p>
+          </form>
+        </div>
+      </section>
+
+      <section id="tab-keys" class="tab-panel hidden">
+        <div class="toolbar">
+          <h2>API keys</h2>
+          <button id="key-new" class="primary">+ Add key</button>
+        </div>
+        <div id="keys-list"></div>
+        <div id="key-form" class="form-card hidden">
+          <h3>Add API key</h3>
+          <form id="key-form-fields">
+            <label>Name <input name="name" required placeholder="e.g. hermes"></label>
+            <label>Key <input name="key" placeholder="blank = auto-generate"></label>
+            <div class="form-actions">
+              <button type="submit" class="primary">Save</button>
+              <button type="button" id="key-form-cancel" class="ghost">Cancel</button>
+            </div>
+            <p id="key-form-error" class="error hidden"></p>
+          </form>
+        </div>
+      </section>
+    </main>
+  </div>
+</div>
+<script src="/assets/app.js"></script>
+</body>
+</html>

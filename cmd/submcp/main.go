@@ -12,6 +12,7 @@ import (
 	"github.com/subimpact/submcp/internal/config"
 	"github.com/subimpact/submcp/internal/db"
 	"github.com/subimpact/submcp/internal/mcp"
+	"github.com/subimpact/submcp/internal/ui"
 )
 
 func main() {
@@ -35,6 +36,15 @@ func main() {
 	auth := mcp.NewAuth(dbPool)
 	srv := mcp.NewServer(dbPool, agg, pool, auth)
 
+	// Admin UI (embedded, mounted at /).
+	adminUI := ui.New(dbPool)
+
+	// Root handler: gateway routes + admin UI.
+	root := http.NewServeMux()
+	root.Handle("/", adminUI.Handler())
+	root.Handle("/health", srv.Handler())
+	root.Handle("/metamcp/", srv.Handler())
+
 	// Idle sweep.
 	go func() {
 		ticker := time.NewTicker(2 * time.Minute)
@@ -46,7 +56,7 @@ func main() {
 
 	httpServer := &http.Server{
 		Addr:              cfg.ListenAddr,
-		Handler:           srv.Handler(),
+		Handler:           root,
 		ReadHeaderTimeout: 10 * time.Second,
 	}
 

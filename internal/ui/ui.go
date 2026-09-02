@@ -1,0 +1,540 @@
+package ui
+
+import (
+	"crypto/rand"
+	"embed"
+	"encoding/hex"
+	"encoding/json"
+	"io/fs"
+	"net/http"
+	"strings"
+	"sync"
+	"time"
+
+	"github.com/subimpact/submcp/internal/db"
+	"github.com/subimpact/submcp/internal/mcp"
+)
+
+//go:embed static
+var staticFS embed.FS
+
+// UI is the embedded admin interface.
+// Serves:
+//   - GET  /            -> admin SPA (login + dashboard)
+//   - POST /api/admin/login    -> {key} -> sets session cookie
+//   - POST /api/admin/logout   -> clears session
+//   - GET  /api/admin/overview -> servers, namespaces, endpoints, keys, tools
+//   - CRUD /api/admin/servers|namespaces|endpoints|keys
+//   - POST /api/admin/servers/:uuid/test -> live connectivity check
+type UI struct {
+	db       *db.Pool
+	sessions *sessionStore
+}
+
+// New creates the admin UI handler.
+func New(dbPool *db.Pool) *UI {
+	return &UI{db: dbPool, sessions: newSessionStore()}
+}
+
+// Handler returns the UI's http.Handler (mounted at /).
+func (u *UI) Handler() http.Handler {
+	mux := http.NewServeMux()
+
+	// Static assets (no auth — they contain no data).
+	sub, _ := fs.Sub(staticFS, "static")
+	mux.Handle("/assets/", http.StripPrefix("/assets/", http.FileServer(http.FS(sub))))
+
+	// API (auth required except login).
+	mux.HandleFunc("/api/admin/login", u.handleLogin)
+	mux.HandleFunc("/api/admin/logout", u.handleLogout)
+	mux.HandleFunc("/api/admin/overview", u.requireAuth(u.handleOverview))
+	mux.HandleFunc("/api/admin/servers", u.requireAuth(u.handleServers))
+	mux.HandleFunc("/api/admin/servers/", u.requireAuth(u.handleServerItem))
+	mux.HandleFunc("/api/admin/namespaces", u.requireAuth(u.handleNamespaces))
+	mux.HandleFunc("/api/admin/namespaces/", u.requireAuth(u.handleNamespaceItem))
+	mux.HandleFunc("/api/admin/endpoints", u.requireAuth(u.handleEndpoints))
+	mux.HandleFunc("/api/admin/endpoints/", u.requireAuth(u.handleEndpointItem))
+	mux.HandleFunc("/api/admin/keys", u.requireAuth(u.handleKeys))
+	mux.HandleFunc("/api/admin/keys/", u.requireAuth(u.handleKeyItem))
+
+	// SPA fallback.
+	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/" {
+			http.NotFound(w, r)
+			return
+		}
+		b, _ := staticFS.ReadFile("static/index.html")
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		w.Write(b)
+	})
+
+	return mux
+}
+
+// --- sessions ---
+
+type sessionStore struct {
+	mu       sync.Mutex
+	sessions map[string]session // token -> session
+}
+
+type session struct {
+	keyName string
+	expires time.Time
+}
+
+func newSessionStore() *sessionStore {
+	return &sessionStore{sessions: make(map[string]session)}
+}
+
+func (s *sessionStore) create(keyName string) string {
+	b := make([]byte, 32)
+	_, _ = rand.Read(b)
+	token := hex.EncodeToString(b)
+	s.mu.Lock()
+	s.sessions[token] = session{keyName: keyName, expires: time.Now().Add(24 * time.Hour)}
+	s.mu.Unlock()
+	return token
+}
+
+func (s *sessionStore) valid(token string) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	sess, ok := s.sessions[token]
+	if !ok {
+		return false
+	}
+	if time.Now().After(sess.expires) {
+		delete(s.sessions, token)
+		return false
+	}
+	return true
+}
+
+func (s *sessionStore) destroy(token string) {
+	s.mu.Lock()
+	delete(s.sessions, token)
+	s.mu.Unlock()
+}
+
+// --- auth helpers ---
+
+const sessionCookie = "submcp_session"
+
+func (u *UI) requireAuth(next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		c, err := r.Cookie(sessionCookie)
+		if err != nil || !u.sessions.valid(c.Value) {
+			writeJSON(w, http.StatusUnauthorized, map[string]any{"error": "unauthorized"})
+			return
+		}
+		next(w, r)
+	}
+}
+
+func (u *UI) handleLogin(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeJSON(w, http.StatusMethodNotAllowed, map[string]any{"error": "method_not_allowed"})
+		return
+	}
+	var body struct {
+		Key string `json:"key"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil || strings.TrimSpace(body.Key) == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "key_required"})
+		return
+	}
+	key, err := u.db.ValidateAPIKey(r.Context(), strings.TrimSpace(body.Key))
+	if err != nil || key == nil {
+		writeJSON(w, http.StatusUnauthorized, map[string]any{"error": "invalid_key"})
+		return
+	}
+	token := u.sessions.create(key.Name)
+	http.SetCookie(w, &http.Cookie{
+		Name:     sessionCookie,
+		Value:    token,
+		Path:     "/",
+		HttpOnly: true,
+		SameSite: http.SameSiteLaxMode,
+		MaxAge:   86400,
+	})
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "name": key.Name})
+}
+
+func (u *UI) handleLogout(w http.ResponseWriter, r *http.Request) {
+	if c, err := r.Cookie(sessionCookie); err == nil {
+		u.sessions.destroy(c.Value)
+	}
+	http.SetCookie(w, &http.Cookie{
+		Name: sessionCookie, Value: "", Path: "/", HttpOnly: true, MaxAge: -1,
+	})
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
+}
+
+// --- overview ---
+
+func (u *UI) handleOverview(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	servers, err := u.db.ListServers(ctx)
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
+		return
+	}
+	namespaces, err := u.db.ListNamespaces(ctx)
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
+		return
+	}
+	endpoints, err := u.db.ListEndpoints(ctx)
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
+		return
+	}
+	keys, err := u.db.ListAPIKeys(ctx)
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
+		return
+	}
+	toolCount, err := u.db.CountTools(ctx)
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
+		return
+	}
+	// Namespace -> server mappings (for the matrix view).
+	mappings := map[string][]db.NamespaceServerMapping{}
+	for _, ns := range namespaces {
+		ms, err := u.db.ListNamespaceServerMappings(ctx, ns.UUID)
+		if err != nil {
+			writeJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
+			return
+		}
+		mappings[ns.UUID] = ms
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"servers":    servers,
+		"namespaces": namespaces,
+		"endpoints":  endpoints,
+		"keys":       keys,
+		"mappings":   mappings,
+		"tool_count": toolCount,
+	})
+}
+
+// --- servers ---
+
+func (u *UI) handleServers(w http.ResponseWriter, r *http.Request) {
+	switch r.Method {
+	case http.MethodGet:
+		servers, err := u.db.ListServers(r.Context())
+		if err != nil {
+			writeJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"servers": servers})
+	case http.MethodPost:
+		var s db.MCPServer
+		if err := json.NewDecoder(r.Body).Decode(&s); err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]any{"error": "invalid_body"})
+			return
+		}
+		if strings.TrimSpace(s.Name) == "" {
+			writeJSON(w, http.StatusBadRequest, map[string]any{"error": "name_required"})
+			return
+		}
+		if s.Type == "" {
+			s.Type = db.ServerTypeStreamableHTTP
+		}
+		if s.Env == nil {
+			s.Env = json.RawMessage(`{}`)
+		}
+		if s.Headers == nil {
+			s.Headers = json.RawMessage(`{}`)
+		}
+		if err := u.db.CreateServer(r.Context(), &s); err != nil {
+			writeJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
+			return
+		}
+		writeJSON(w, http.StatusCreated, map[string]any{"server": s})
+	default:
+		writeJSON(w, http.StatusMethodNotAllowed, map[string]any{"error": "method_not_allowed"})
+	}
+}
+
+func (u *UI) handleServerItem(w http.ResponseWriter, r *http.Request) {
+	id := strings.TrimPrefix(r.URL.Path, "/api/admin/servers/")
+	if id == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "id_required"})
+		return
+	}
+	// Test-connection sub-route.
+	if strings.HasSuffix(id, "/test") {
+		u.handleServerTest(w, r, strings.TrimSuffix(id, "/test"))
+		return
+	}
+	switch r.Method {
+	case http.MethodPut:
+		var s db.MCPServer
+		if err := json.NewDecoder(r.Body).Decode(&s); err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]any{"error": "invalid_body"})
+			return
+		}
+		s.UUID = id
+		if err := u.db.UpdateServer(r.Context(), &s); err != nil {
+			writeJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"ok": true})
+	case http.MethodDelete:
+		if err := u.db.DeleteServer(r.Context(), id); err != nil {
+			writeJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"ok": true})
+	default:
+		writeJSON(w, http.StatusMethodNotAllowed, map[string]any{"error": "method_not_allowed"})
+	}
+}
+
+// handleServerTest performs a live initialize + tools/list against the
+// upstream to verify connectivity (used by the UI "Test" button).
+func (u *UI) handleServerTest(w http.ResponseWriter, r *http.Request, id string) {
+	srv, err := u.db.GetServer(r.Context(), id)
+	if err != nil || srv == nil {
+		writeJSON(w, http.StatusNotFound, map[string]any{"error": "server_not_found"})
+		return
+	}
+	if srv.Type != db.ServerTypeStreamableHTTP || srv.URL == nil || *srv.URL == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "only_streamable_http_supported"})
+		return
+	}
+	headers := map[string]string{}
+	if len(srv.Headers) > 0 {
+		_ = json.Unmarshal(srv.Headers, &headers)
+	}
+	client := mcp.NewUpstreamClient(mcp.UpstreamConfig{
+		Name:        srv.Name,
+		URL:         *srv.URL,
+		BearerToken: deref(srv.BearerToken),
+		Headers:     headers,
+		Timeout:     10 * time.Second,
+	})
+	ctx := r.Context()
+	if err := client.Connect(ctx); err != nil {
+		writeJSON(w, http.StatusOK, map[string]any{"ok": false, "error": err.Error()})
+		return
+	}
+	defer client.Close(ctx)
+	tools, err := client.ListTools(ctx)
+	if err != nil {
+		writeJSON(w, http.StatusOK, map[string]any{"ok": false, "error": err.Error()})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "tools": len(tools)})
+}
+
+func deref(s *string) string {
+	if s == nil {
+		return ""
+	}
+	return *s
+}
+
+// --- namespaces ---
+
+func (u *UI) handleNamespaces(w http.ResponseWriter, r *http.Request) {
+	switch r.Method {
+	case http.MethodGet:
+		ns, err := u.db.ListNamespaces(r.Context())
+		if err != nil {
+			writeJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"namespaces": ns})
+	case http.MethodPost:
+		var n db.Namespace
+		if err := json.NewDecoder(r.Body).Decode(&n); err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]any{"error": "invalid_body"})
+			return
+		}
+		if strings.TrimSpace(n.Name) == "" {
+			writeJSON(w, http.StatusBadRequest, map[string]any{"error": "name_required"})
+			return
+		}
+		if err := u.db.CreateNamespace(r.Context(), &n); err != nil {
+			writeJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
+			return
+		}
+		writeJSON(w, http.StatusCreated, map[string]any{"namespace": n})
+	default:
+		writeJSON(w, http.StatusMethodNotAllowed, map[string]any{"error": "method_not_allowed"})
+	}
+}
+
+func (u *UI) handleNamespaceItem(w http.ResponseWriter, r *http.Request) {
+	id := strings.TrimPrefix(r.URL.Path, "/api/admin/namespaces/")
+	if id == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "id_required"})
+		return
+	}
+	switch r.Method {
+	case http.MethodPost:
+		// Toggle a server mapping: {server_uuid, status}
+		var body struct {
+			ServerUUID string `json:"server_uuid"`
+			Status     string `json:"status"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil || body.ServerUUID == "" {
+			writeJSON(w, http.StatusBadRequest, map[string]any{"error": "server_uuid_required"})
+			return
+		}
+		status := db.ServerStatusActive
+		if body.Status == "INACTIVE" {
+			status = db.ServerStatusInactive
+		}
+		if err := u.db.SetServerMapping(r.Context(), id, body.ServerUUID, status); err != nil {
+			writeJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"ok": true})
+	case http.MethodDelete:
+		if err := u.db.DeleteNamespace(r.Context(), id); err != nil {
+			writeJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"ok": true})
+	default:
+		writeJSON(w, http.StatusMethodNotAllowed, map[string]any{"error": "method_not_allowed"})
+	}
+}
+
+// --- endpoints ---
+
+func (u *UI) handleEndpoints(w http.ResponseWriter, r *http.Request) {
+	switch r.Method {
+	case http.MethodGet:
+		eps, err := u.db.ListEndpoints(r.Context())
+		if err != nil {
+			writeJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"endpoints": eps})
+	case http.MethodPost:
+		var e db.Endpoint
+		if err := json.NewDecoder(r.Body).Decode(&e); err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]any{"error": "invalid_body"})
+			return
+		}
+		if strings.TrimSpace(e.Name) == "" || e.NamespaceUUID == "" {
+			writeJSON(w, http.StatusBadRequest, map[string]any{"error": "name_and_namespace_required"})
+			return
+		}
+		if err := u.db.CreateEndpoint(r.Context(), &e); err != nil {
+			writeJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
+			return
+		}
+		writeJSON(w, http.StatusCreated, map[string]any{"endpoint": e})
+	default:
+		writeJSON(w, http.StatusMethodNotAllowed, map[string]any{"error": "method_not_allowed"})
+	}
+}
+
+func (u *UI) handleEndpointItem(w http.ResponseWriter, r *http.Request) {
+	id := strings.TrimPrefix(r.URL.Path, "/api/admin/endpoints/")
+	if id == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "id_required"})
+		return
+	}
+	switch r.Method {
+	case http.MethodPut:
+		var e db.Endpoint
+		if err := json.NewDecoder(r.Body).Decode(&e); err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]any{"error": "invalid_body"})
+			return
+		}
+		e.UUID = id
+		if err := u.db.UpdateEndpoint(r.Context(), &e); err != nil {
+			writeJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"ok": true})
+	case http.MethodDelete:
+		if err := u.db.DeleteEndpoint(r.Context(), id); err != nil {
+			writeJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"ok": true})
+	default:
+		writeJSON(w, http.StatusMethodNotAllowed, map[string]any{"error": "method_not_allowed"})
+	}
+}
+
+// --- API keys ---
+
+func (u *UI) handleKeys(w http.ResponseWriter, r *http.Request) {
+	switch r.Method {
+	case http.MethodGet:
+		keys, err := u.db.ListAPIKeys(r.Context())
+		if err != nil {
+			writeJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"keys": keys})
+	case http.MethodPost:
+		var body struct {
+			Name string `json:"name"`
+			Key  string `json:"key"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil || strings.TrimSpace(body.Name) == "" {
+			writeJSON(w, http.StatusBadRequest, map[string]any{"error": "name_required"})
+			return
+		}
+		key := strings.TrimSpace(body.Key)
+		if key == "" {
+			// Generate a key if none provided.
+			b := make([]byte, 24)
+			_, _ = rand.Read(b)
+			key = "sk_mt_" + hex.EncodeToString(b)
+		}
+		k, err := u.db.CreateAPIKey(r.Context(), body.Name, key)
+		if err != nil {
+			writeJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
+			return
+		}
+		writeJSON(w, http.StatusCreated, map[string]any{"key": k})
+	default:
+		writeJSON(w, http.StatusMethodNotAllowed, map[string]any{"error": "method_not_allowed"})
+	}
+}
+
+func (u *UI) handleKeyItem(w http.ResponseWriter, r *http.Request) {
+	id := strings.TrimPrefix(r.URL.Path, "/api/admin/keys/")
+	if id == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "id_required"})
+		return
+	}
+	switch r.Method {
+	case http.MethodPost:
+		var body struct {
+			Active *bool `json:"active"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil || body.Active == nil {
+			writeJSON(w, http.StatusBadRequest, map[string]any{"error": "active_required"})
+			return
+		}
+		if err := u.db.SetAPIKeyActive(r.Context(), id, *body.Active); err != nil {
+			writeJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"ok": true})
+	default:
+		writeJSON(w, http.StatusMethodNotAllowed, map[string]any{"error": "method_not_allowed"})
+	}
+}
+
+// --- helpers ---
+
+func writeJSON(w http.ResponseWriter, status int, v any) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	_ = json.NewEncoder(w).Encode(v)
+}

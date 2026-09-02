@@ -6,9 +6,11 @@ RUN go mod download
 COPY . .
 RUN CGO_ENABLED=0 go build -ldflags="-s -w" -o /submcp ./cmd/submcp
 
-# Runtime stage
-FROM scratch
+# Runtime stage (alpine: provides wget for the healthcheck)
+FROM alpine:3.20
+RUN apk add --no-cache ca-certificates wget
 COPY --from=builder /submcp /submcp
-COPY --from=builder /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt
-EXPOSE 12009
+EXPOSE 12008
+HEALTHCHECK --interval=10s --timeout=5s --retries=5 \
+  CMD wget -q -O /dev/null http://127.0.0.1:12008/health || exit 1
 ENTRYPOINT ["/submcp"]

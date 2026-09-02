@@ -4,6 +4,7 @@ bin/
 # Env
 .env
 .env.*
+!.env.prod.example
 
 # Backups
 backups/
