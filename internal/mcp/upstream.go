@@ -102,7 +102,7 @@ func (c *UpstreamClient) Connect(ctx context.Context) error {
 	}
 
 	// Read SSE stream: first event should be the initialize result.
-	initRes, err := readFirstSSEMessage(resp.Body)
+	initRes, err := readFirstSSEMessage(resp.Body, "1")
 	if err != nil {
 		return fmt.Errorf("read initialize result from %s: %w", c.serverName, err)
 	}
@@ -160,7 +160,7 @@ func (c *UpstreamClient) ListTools(ctx context.Context) ([]Tool, error) {
 		return nil, fmt.Errorf("tools/list %s: HTTP %d: %s", c.serverName, resp.StatusCode, truncate(string(raw), 300))
 	}
 
-	msg, err := readFirstSSEMessage(resp.Body)
+	msg, err := readFirstSSEMessage(resp.Body, "2")
 	if err != nil {
 		return nil, err
 	}
@@ -220,7 +220,7 @@ func (c *UpstreamClient) CallTool(ctx context.Context, name string, args json.Ra
 		return nil, fmt.Errorf("tools/call %s: HTTP %d: %s", c.serverName, resp.StatusCode, truncate(string(raw), 300))
 	}
 
-	msg, err := readFirstSSEMessage(resp.Body)
+	msg, err := readFirstSSEMessage(resp.Body, "3")
 	if err != nil {
 		return nil, err
 	}
@@ -266,7 +266,17 @@ func (c *UpstreamClient) applyHeaders(req *http.Request) {
 
 // readFirstSSEMessage reads the first SSE event from a stream and returns
 // its data payload. Handles both SSE framing and plain JSON responses.
-func readFirstSSEMessage(r io.Reader) ([]byte, error) {
+//
+// P1-1+P1-11 rewrite:
+//   - multi-line data: consecutive "data:" lines are joined with "\n"
+//     (SSE spec); the payload is only complete at the blank line
+//   - leading whitespace: exactly one leading space after "data:" is
+//     stripped (spec); additional whitespace is preserved
+//   - request-id matching: events whose "id:" field does not match the
+//     request id are skipped (some servers emit notifications first)
+//   - body drain: the stream is read to EOF so the connection can be
+//     reused (enables P2-14 transport tuning)
+func readFirstSSEMessage(r io.Reader, wantID string) ([]byte, error) {
 	// Peek: if the body starts with '{', it's plain JSON (no SSE framing).
 	br := bufio.NewReader(r)
 	first, err := br.Peek(1)
@@ -277,26 +287,102 @@ func readFirstSSEMessage(r io.Reader) ([]byte, error) {
 		return io.ReadAll(io.LimitReader(br, 16<<20))
 	}
 
-	var data []byte
+	var (
+		dataLines []string
+		inEvent   bool
+	)
 	scanner := bufio.NewScanner(br)
 	scanner.Buffer(make([]byte, 0, 64*1024), 16<<20)
 	for scanner.Scan() {
 		line := scanner.Text()
-		if strings.HasPrefix(line, "data:") {
-			payload := strings.TrimSpace(strings.TrimPrefix(line, "data:"))
-			if payload != "" {
-				data = []byte(payload)
-				break
+		if line == "" {
+			// Blank line terminates the event. Accept it when:
+			//   - it has data, AND
+			//   - it is not a JSON-RPC notification (no "id" member in
+			//     the payload — some servers emit notifications first),
+			//     AND
+			//   - its JSON-RPC id matches the expected id (when one is
+			//     expected). NOTE: the SSE "id:" field is an event-stream
+			//     identifier (Last-Event-ID), NOT a request correlation
+			//     id — apify emits a UUID there. Correlation is done via
+			//     the JSON-RPC payload id only.
+			if len(dataLines) > 0 {
+				payload := []byte(strings.Join(dataLines, "\n"))
+				if wantID != "" && !jsonRPCIDMatches(payload, wantID) {
+					// Notification or mismatched id: skip this event.
+					dataLines = nil
+					inEvent = false
+					continue
+				}
+				return payload, nil
 			}
+			// Mismatched event: reset and keep scanning.
+			dataLines = nil
+			inEvent = false
+			continue
+		}
+		switch {
+		case strings.HasPrefix(line, "data:"):
+			inEvent = true
+			// Spec: strip exactly one leading space after the colon.
+			payload := strings.TrimPrefix(line, "data:")
+			if strings.HasPrefix(payload, " ") {
+				payload = payload[1:]
+			}
+			dataLines = append(dataLines, payload)
+		case strings.HasPrefix(line, "id:"):
+			// Event-stream id (Last-Event-ID) — NOT a correlation id.
+			// Ignored for matching; see comment above.
+		case strings.HasPrefix(line, "event:"):
+			// Event type is informational; we match on id only.
+		case strings.HasPrefix(line, "retry:"):
+			// Ignore.
+		default:
+			// Comment or unknown field: ignore.
 		}
 	}
 	if err := scanner.Err(); err != nil {
 		return nil, err
 	}
-	if data == nil {
-		return nil, fmt.Errorf("no SSE data event received")
+	// Stream ended without a blank line: return what we have if it's a
+	// complete event (some servers omit the trailing blank line).
+	if len(dataLines) > 0 {
+		payload := []byte(strings.Join(dataLines, "\n"))
+		if wantID != "" && !jsonRPCIDMatches(payload, wantID) {
+			return nil, fmt.Errorf("no SSE data event with id %s received", wantID)
+		}
+		return payload, nil
 	}
-	return data, nil
+	if inEvent {
+		return nil, fmt.Errorf("no complete SSE data event received")
+	}
+	return nil, fmt.Errorf("no SSE data event received")
+}
+
+// jsonRPCIDMatches reports whether a JSON-RPC payload's "id" member matches
+// the expected id. Payloads without an id (notifications) never match when
+// an id is expected. Comparison is stringified (JSON-RPC ids may be
+// numbers or strings; our requests use numbers).
+func jsonRPCIDMatches(payload []byte, wantID string) bool {
+	var probe struct {
+		ID json.RawMessage `json:"id"`
+	}
+	if err := json.Unmarshal(payload, &probe); err != nil {
+		return true // not JSON we can parse — don't skip it
+	}
+	if len(probe.ID) == 0 || string(probe.ID) == "null" {
+		return false // notification
+	}
+	var got string
+	if err := json.Unmarshal(probe.ID, &got); err != nil {
+		// Not a string — try number.
+		var n json.Number
+		if err := json.Unmarshal(probe.ID, &n); err != nil {
+			return true // unparseable id — don't skip
+		}
+		got = n.String()
+	}
+	return got == wantID
 }
 
 func truncate(s string, n int) string {
