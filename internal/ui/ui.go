@@ -32,6 +32,11 @@ type UI struct {
 	db       *db.Pool
 	sessions *sessionStore
 	start    time.Time
+
+	// Public stats cache (A8): 60s TTL, avoids DB hits per landing page load.
+	statsMu    sync.Mutex
+	statsCache map[string]any
+	statsAt    time.Time
 }
 
 // New creates the web UI handler.
@@ -91,21 +96,32 @@ func (u *UI) handleLanding(w http.ResponseWriter, r *http.Request) {
 
 // handlePublicStats returns non-sensitive gateway stats for the landing page.
 // No auth: exposes only names, types, error status, and counts.
+// Cached in-process for 60s (A8) so page loads don't hit the DB on every
+// request; errors are generic (no DB internals leaked to unauthenticated
+// callers).
 func (u *UI) handlePublicStats(w http.ResponseWriter, r *http.Request) {
+	u.statsMu.Lock()
+	if u.statsCache != nil && time.Since(u.statsAt) < 60*time.Second {
+		writeJSON(w, http.StatusOK, u.statsCache)
+		u.statsMu.Unlock()
+		return
+	}
+	u.statsMu.Unlock()
+
 	ctx := r.Context()
 	servers, err := u.db.ListServers(ctx)
 	if err != nil {
-		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
+		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": "unavailable"})
 		return
 	}
 	toolCount, err := u.db.CountTools(ctx)
 	if err != nil {
-		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
+		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": "unavailable"})
 		return
 	}
 	nsCount, err := u.db.CountNamespaces(ctx)
 	if err != nil {
-		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
+		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": "unavailable"})
 		return
 	}
 	upstreams := make([]map[string]any, 0, len(servers))
@@ -116,14 +132,21 @@ func (u *UI) handlePublicStats(w http.ResponseWriter, r *http.Request) {
 			"error_status": s.ErrorStatus,
 		})
 	}
-	writeJSON(w, http.StatusOK, map[string]any{
+	payload := map[string]any{
 		"version":    "0.1.0",
 		"uptime":     time.Since(u.start).Round(time.Second).String(),
 		"servers":    len(servers),
 		"namespaces": nsCount,
 		"tools":      toolCount,
 		"upstreams":  upstreams,
-	})
+	}
+
+	u.statsMu.Lock()
+	u.statsCache = payload
+	u.statsAt = time.Now()
+	u.statsMu.Unlock()
+
+	writeJSON(w, http.StatusOK, payload)
 }
 
 // --- sessions ---

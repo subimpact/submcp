@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"log"
+	"log/slog"
 	"net/http"
 	"os"
 	"os/signal"
@@ -17,6 +18,21 @@ import (
 
 func main() {
 	cfg := config.Get()
+
+	// Structured logging (P1-14): slog with level from config.
+	var level slog.Level
+	switch cfg.LogLevel {
+	case "debug":
+		level = slog.LevelDebug
+	case "warn":
+		level = slog.LevelWarn
+	case "error":
+		level = slog.LevelError
+	default:
+		level = slog.LevelInfo
+	}
+	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: level}))
+	slog.SetDefault(logger)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
@@ -51,6 +67,10 @@ func main() {
 	root.Handle("/health", srv.Handler())
 	root.Handle("/metamcp/", srv.Handler())
 
+	// Request logging middleware (P1-14): method, path, status, duration,
+	// client IP, and a request ID for correlation.
+	handler := withRequestLogging(logger, root)
+
 	// Idle sweep.
 	go func() {
 		ticker := time.NewTicker(2 * time.Minute)
@@ -62,7 +82,7 @@ func main() {
 
 	httpServer := &http.Server{
 		Addr:              cfg.ListenAddr,
-		Handler:           root,
+		Handler:           handler,
 		ReadHeaderTimeout: 10 * time.Second,
 	}
 
@@ -81,4 +101,32 @@ func main() {
 	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer shutdownCancel()
 	_ = httpServer.Shutdown(shutdownCtx)
+}
+
+// withRequestLogging wraps a handler with structured request logging.
+func withRequestLogging(logger *slog.Logger, next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		start := time.Now()
+		rec := &statusRecorder{ResponseWriter: w, status: http.StatusOK}
+		next.ServeHTTP(rec, r)
+		logger.Info("request",
+			"method", r.Method,
+			"path", r.URL.Path,
+			"status", rec.status,
+			"duration_ms", time.Since(start).Milliseconds(),
+			"ip", r.RemoteAddr,
+			"ua", r.UserAgent(),
+		)
+	})
+}
+
+// statusRecorder captures the response status for logging.
+type statusRecorder struct {
+	http.ResponseWriter
+	status int
+}
+
+func (r *statusRecorder) WriteHeader(status int) {
+	r.status = status
+	r.ResponseWriter.WriteHeader(status)
 }
