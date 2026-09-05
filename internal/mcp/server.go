@@ -201,7 +201,7 @@ func (s *Server) handlePost(w http.ResponseWriter, r *http.Request, ep *db.Endpo
 		// existing session to a different endpoint is a hijack vector
 		// (P0-1).
 		sessionID = newUUID()
-		result := s.handleInitialize(r.Context(), ep)
+		result := s.handleInitialize(r.Context(), ep, req)
 		s.sessions.Put(sessionID, ep.NamespaceUUID, ep.UUID)
 		w.Header().Set("mcp-session-id", sessionID)
 		writeSSE(w, r, newResponse(req.ID, result, nil))
@@ -240,19 +240,37 @@ func (s *Server) handlePost(w http.ResponseWriter, r *http.Request, ep *db.Endpo
 	}
 }
 
-func (s *Server) handleInitialize(ctx context.Context, ep *db.Endpoint) map[string]any {
+func (s *Server) handleInitialize(ctx context.Context, ep *db.Endpoint, req Request) map[string]any {
+	// P1-10: protocol version negotiation — echo the client's version if
+	// we support it, else fall back to 2025-03-26.
+	version := "2025-03-26"
+	var params InitializeParams
+	if len(req.Params) > 0 {
+		_ = json.Unmarshal(req.Params, &params)
+	}
+	if params.ProtocolVersion != "" && supportedProtocolVersions[params.ProtocolVersion] {
+		version = params.ProtocolVersion
+	}
 	return map[string]any{
-		"protocolVersion": "2025-03-26",
+		"protocolVersion": version,
+		// Advertise tools only (P1-10): submcp implements tools/list and
+		// tools/call; prompts/resources are not implemented, so claiming
+		// them would be a lie to clients.
 		"capabilities": map[string]any{
-			"tools":     map[string]any{},
-			"prompts":   map[string]any{},
-			"resources": map[string]any{},
+			"tools": map[string]any{},
 		},
 		"serverInfo": map[string]string{
 			"name":    "submcp",
 			"version": "0.1.0",
 		},
 	}
+}
+
+// supportedProtocolVersions are the MCP protocol versions submcp can speak.
+var supportedProtocolVersions = map[string]bool{
+	"2024-11-05": true,
+	"2025-03-26": true,
+	"2025-06-18": true,
 }
 
 // handleStreamableGET opens an SSE stream for an existing session.

@@ -167,6 +167,38 @@ func TestMissingSessionIDOnNonInitialize(t *testing.T) {
 	}
 }
 
+// TestInitializeEchoesSupportedVersion: a client requesting a supported
+// protocol version gets it echoed (P1-10).
+func TestInitializeEchoesSupportedVersion(t *testing.T) {
+	s := newTestServer()
+	rr := doPost(t, s, "/metamcp/a/mcp", "",
+		`{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"t","version":"1"}}}`)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("initialize: got %d", rr.Code)
+	}
+	if !strings.Contains(rr.Body.String(), `"protocolVersion":"2025-06-18"`) {
+		t.Fatalf("expected echoed version, got: %s", rr.Body.String())
+	}
+	// Capabilities must advertise tools only (P1-10).
+	if strings.Contains(rr.Body.String(), `"prompts"`) || strings.Contains(rr.Body.String(), `"resources"`) {
+		t.Fatalf("must not advertise unimplemented capabilities: %s", rr.Body.String())
+	}
+}
+
+// TestInitializeFallsBackOnUnknownVersion: an unsupported client version
+// falls back to 2025-03-26 (P1-10).
+func TestInitializeFallsBackOnUnknownVersion(t *testing.T) {
+	s := newTestServer()
+	rr := doPost(t, s, "/metamcp/a/mcp", "",
+		`{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2099-01-01","capabilities":{},"clientInfo":{"name":"t","version":"1"}}}`)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("initialize: got %d", rr.Code)
+	}
+	if !strings.Contains(rr.Body.String(), `"protocolVersion":"2025-03-26"`) {
+		t.Fatalf("expected fallback version, got: %s", rr.Body.String())
+	}
+}
+
 // TestAuthScoping: a key owned by user X must be rejected on an endpoint
 // owned by user Y (P0-6).
 func TestAuthScoping(t *testing.T) {
