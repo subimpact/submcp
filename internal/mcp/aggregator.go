@@ -16,36 +16,78 @@ import (
 	"github.com/subimpact/submcp/internal/db"
 )
 
+// ToolStore is the DB surface the aggregator needs (extracted for tests).
+type ToolStore interface {
+	GetActiveServersForNamespace(ctx context.Context, namespaceUUID string) ([]db.MCPServer, error)
+	GetToolMappings(ctx context.Context, namespaceUUID string) ([]struct {
+		Mapping db.NamespaceToolMapping
+		Tool    db.Tool
+	}, error)
+	SyncTools(ctx context.Context, serverUUID string, tools []db.SyncToolInput) error
+}
+
 // Aggregator fans out MCP requests to all upstreams in a namespace and
 // merges results:
 //   - tool names prefixed: sanitizeName(serverName) + "__" + toolName
 //   - per-server failure isolation (a dead upstream is skipped, others still respond)
-//   - tools/list syncs discovered tools into the tools table (hash-gated)
-//   - tool filtering via namespace_tool_mappings (ACTIVE only)
-//   - tool overrides (name/title/description/annotations)
+//   - per-serverUUID raw-tool cache (60s TTL, single-flight refresh,
+//     serve-stale on upstream failure) — tools/list does NOT hit every
+//     upstream on every request (P1-9+P1-18)
+//   - route map built in the same pass: prefixed name -> serverUUID,
+//     first-server-wins on collision (P1-18)
+//   - tools/list syncs discovered tools into the tools table (hash-gated, P1-5)
+//   - tool filtering via namespace_tool_mappings (ACTIVE only) and
+//     overrides applied per-request (admin changes immediate)
 type Aggregator struct {
-	pool   *Pool
-	db     *db.Pool
-	mu     sync.Mutex
-	caches map[string]*nsCache
+	pool *Pool
+	db   ToolStore
 
-	// Tools sync hash-gate (P1-5): serverUUID -> sha256 of sorted tool
-	// names. Mirrors tools-sync-cache.ts — only sync when names changed.
+	mu     sync.Mutex
+	caches map[string]*nsCache // namespaceUUID -> servers (5s TTL)
+
+	// P1-9: per-serverUUID raw tool cache.
+	toolMu    sync.Mutex
+	toolCache map[string]*toolCacheEntry
+	inflight  map[string]*sync.WaitGroup // single-flight per server
+
+	// P1-18: per-namespace route map (prefixed name -> serverUUID).
+	routeMu sync.Mutex
+	routes  map[string]*nsRoute
+
+	// P1-5: tools sync hash-gate.
 	syncMu     sync.Mutex
 	syncHashes map[string]string
 }
+
+const (
+	nsCacheTTL   = 5 * time.Second
+	toolCacheTTL = 60 * time.Second
+)
 
 type nsCache struct {
 	servers []db.MCPServer
 	at      time.Time
 }
 
+type toolCacheEntry struct {
+	tools []Tool // raw, unprefixed
+	at    time.Time
+}
+
+type nsRoute struct {
+	routeMap map[string]string // prefixed tool name -> serverUUID
+	at       time.Time
+}
+
 // NewAggregator creates the fan-out engine.
-func NewAggregator(pool *Pool, dbPool *db.Pool) *Aggregator {
+func NewAggregator(pool *Pool, dbPool ToolStore) *Aggregator {
 	return &Aggregator{
 		pool:       pool,
 		db:         dbPool,
 		caches:     make(map[string]*nsCache),
+		toolCache:  make(map[string]*toolCacheEntry),
+		inflight:   make(map[string]*sync.WaitGroup),
+		routes:     make(map[string]*nsRoute),
 		syncHashes: make(map[string]string),
 	}
 }
@@ -78,7 +120,13 @@ func (a *Aggregator) ListTools(ctx context.Context, namespaceUUID string) ([]Too
 		return nil, err
 	}
 
-	// Load tool mappings for filtering + overrides.
+	// Build/refresh the route map (also warms the tool cache).
+	if _, err := a.buildRouteMap(ctx, namespaceUUID, servers); err != nil {
+		return nil, err
+	}
+
+	// Load tool mappings for filtering + overrides (per-request, so admin
+	// changes are immediate — never cached).
 	mappings, err := a.db.GetToolMappings(ctx, namespaceUUID)
 	if err != nil {
 		return nil, err
@@ -103,10 +151,10 @@ func (a *Aggregator) ListTools(ctx context.Context, namespaceUUID string) ([]Too
 	}
 
 	var (
-		mu     sync.Mutex
-		all    []Tool
-		errs   []string
-		wg     sync.WaitGroup
+		mu   sync.Mutex
+		all  []Tool
+		errs []string
+		wg   sync.WaitGroup
 	)
 	for _, srv := range servers {
 		if srv.Type != db.ServerTypeStreamableHTTP && srv.Type != db.ServerTypeSSE {
@@ -115,7 +163,7 @@ func (a *Aggregator) ListTools(ctx context.Context, namespaceUUID string) ([]Too
 		wg.Add(1)
 		go func(s db.MCPServer) {
 			defer wg.Done()
-			tools, err := a.listFromServer(ctx, s, overrideNamesByServer[s.UUID])
+			tools, err := a.getServerTools(ctx, s, overrideNamesByServer[s.UUID])
 			if err != nil {
 				mu.Lock()
 				errs = append(errs, fmt.Sprintf("%s: %v", s.Name, err))
@@ -194,9 +242,30 @@ func (a *Aggregator) CallTool(ctx context.Context, namespaceUUID, sessionID, too
 	if err != nil {
 		return nil, err
 	}
+
+	// Route via the map (build on demand if stale/missing — P1-18
+	// build-on-demand for CallTool-before-ListTools).
+	serverUUID := ""
+	if routeMap, err := a.buildRouteMap(ctx, namespaceUUID, servers); err == nil {
+		serverUUID = routeMap[toolName]
+	}
+	if serverUUID == "" {
+		// Fall back to prefix matching (server may be new, or the tool
+		// was added upstream after the last route build).
+		for i := range servers {
+			if SanitizeName(servers[i].Name) == serverName {
+				serverUUID = servers[i].UUID
+				break
+			}
+		}
+	}
+	if serverUUID == "" {
+		return nil, fmt.Errorf("no active server matching %q in namespace", serverName)
+	}
+
 	var target *db.MCPServer
 	for i := range servers {
-		if SanitizeName(servers[i].Name) == serverName {
+		if servers[i].UUID == serverUUID {
 			target = &servers[i]
 			break
 		}
@@ -230,7 +299,71 @@ func (a *Aggregator) CallTool(ctx context.Context, namespaceUUID, sessionID, too
 	return client.CallTool(ctx, originalName, args)
 }
 
-func (a *Aggregator) listFromServer(ctx context.Context, s db.MCPServer, overrideNames map[string]bool) ([]Tool, error) {
+// getServerTools returns PREFIXED tools for a server, using the 60s cache.
+// Cache miss: fetch from upstream (single-flight per server), sync to DB
+// (hash-gated), cache. Upstream failure with stale cache: serve stale.
+func (a *Aggregator) getServerTools(ctx context.Context, s db.MCPServer, overrideNames map[string]bool) ([]Tool, error) {
+	// Fast path: fresh cache.
+	a.toolMu.Lock()
+	if e, ok := a.toolCache[s.UUID]; ok && time.Since(e.at) < toolCacheTTL {
+		tools := prefixTools(s.Name, e.tools)
+		a.toolMu.Unlock()
+		return tools, nil
+	}
+	a.toolMu.Unlock()
+
+	// Single-flight: one fetch per server at a time.
+	a.toolMu.Lock()
+	wg, ok := a.inflight[s.UUID]
+	if !ok {
+		wg = &sync.WaitGroup{}
+		wg.Add(1)
+		a.inflight[s.UUID] = wg
+	}
+	a.toolMu.Unlock()
+
+	if ok {
+		// Another goroutine is fetching; wait for it, then serve cache.
+		wg.Wait()
+		a.toolMu.Lock()
+		e, ok := a.toolCache[s.UUID]
+		a.toolMu.Unlock()
+		if ok {
+			return prefixTools(s.Name, e.tools), nil
+		}
+		return nil, fmt.Errorf("server %q tools unavailable", s.Name)
+	}
+
+	// We are the fetcher.
+	defer func() {
+		a.toolMu.Lock()
+		delete(a.inflight, s.UUID)
+		a.toolMu.Unlock()
+		wg.Done()
+	}()
+
+	tools, err := a.fetchServerTools(ctx, s, overrideNames)
+	if err != nil {
+		// Serve stale if we have it.
+		a.toolMu.Lock()
+		e, hasStale := a.toolCache[s.UUID]
+		a.toolMu.Unlock()
+		if hasStale {
+			slog.Warn("upstream tools/list failed; serving stale", "server", s.Name, "err", err)
+			return prefixTools(s.Name, e.tools), nil
+		}
+		return nil, err
+	}
+
+	a.toolMu.Lock()
+	a.toolCache[s.UUID] = &toolCacheEntry{tools: tools, at: time.Now()}
+	a.toolMu.Unlock()
+	return prefixTools(s.Name, tools), nil
+}
+
+// fetchServerTools fetches raw (unprefixed) tools from upstream and syncs
+// them to the DB (P1-5, hash-gated, non-fatal).
+func (a *Aggregator) fetchServerTools(ctx context.Context, s db.MCPServer, overrideNames map[string]bool) ([]Tool, error) {
 	if s.URL == nil || *s.URL == "" {
 		return nil, fmt.Errorf("server %q has no URL configured", s.Name)
 	}
@@ -264,12 +397,72 @@ func (a *Aggregator) listFromServer(ctx context.Context, s db.MCPServer, overrid
 	// original's proxy sync: only sync when the tool-name set changed,
 	// filter out override names, never fail the response on DB errors.
 	a.syncTools(ctx, s, tools, overrideNames)
-
-	// Prefix tool names.
-	for i := range tools {
-		tools[i].Name = ToolName(s.Name, tools[i].Name)
-	}
 	return tools, nil
+}
+
+// prefixTools returns a copy of tools with names prefixed server__tool.
+func prefixTools(serverName string, tools []Tool) []Tool {
+	out := make([]Tool, len(tools))
+	for i, t := range tools {
+		out[i] = t
+		out[i].Name = ToolName(serverName, t.Name)
+	}
+	return out
+}
+
+// buildRouteMap builds (or refreshes) the per-namespace route map:
+// prefixed tool name -> serverUUID. First-server-wins on collision (log).
+// Also warms the tool cache. TTL 5s (folded nsCache).
+func (a *Aggregator) buildRouteMap(ctx context.Context, namespaceUUID string, servers []db.MCPServer) (map[string]string, error) {
+	a.routeMu.Lock()
+	if r, ok := a.routes[namespaceUUID]; ok && time.Since(r.at) < nsCacheTTL {
+		a.routeMu.Unlock()
+		return r.routeMap, nil
+	}
+	a.routeMu.Unlock()
+
+	routeMap := make(map[string]string)
+	var (
+		mu   sync.Mutex
+		errs []string
+		wg   sync.WaitGroup
+	)
+	for _, srv := range servers {
+		if srv.Type != db.ServerTypeStreamableHTTP && srv.Type != db.ServerTypeSSE {
+			continue
+		}
+		wg.Add(1)
+		go func(s db.MCPServer) {
+			defer wg.Done()
+			tools, err := a.getServerTools(ctx, s, nil)
+			if err != nil {
+				mu.Lock()
+				errs = append(errs, fmt.Sprintf("%s: %v", s.Name, err))
+				mu.Unlock()
+				return
+			}
+			mu.Lock()
+			defer mu.Unlock()
+			for _, t := range tools {
+				if _, exists := routeMap[t.Name]; exists {
+					slog.Warn("tool name collision; first server wins",
+						"tool", t.Name, "server", s.Name)
+					continue
+				}
+				routeMap[t.Name] = s.UUID
+			}
+		}(srv)
+	}
+	wg.Wait()
+
+	a.routeMu.Lock()
+	a.routes[namespaceUUID] = &nsRoute{routeMap: routeMap, at: time.Now()}
+	a.routeMu.Unlock()
+
+	if len(routeMap) == 0 && len(errs) > 0 {
+		return nil, fmt.Errorf("all upstreams failed: %s", strings.Join(errs, "; "))
+	}
+	return routeMap, nil
 }
 
 // toolNamesHash mirrors tools-sync-cache.ts: sha256 of the sorted names
@@ -331,7 +524,7 @@ func (a *Aggregator) syncTools(ctx context.Context, s db.MCPServer, tools []Tool
 
 func (a *Aggregator) getServers(ctx context.Context, namespaceUUID string) ([]db.MCPServer, error) {
 	a.mu.Lock()
-	if c, ok := a.caches[namespaceUUID]; ok && time.Since(c.at) < 5*time.Second {
+	if c, ok := a.caches[namespaceUUID]; ok && time.Since(c.at) < nsCacheTTL {
 		a.mu.Unlock()
 		return c.servers, nil
 	}

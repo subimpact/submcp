@@ -4,14 +4,15 @@ import (
 	"context"
 	"fmt"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
 
 // fakeFactory returns a client whose identity is the counter value.
-func fakeFactory(n *int) func() (*UpstreamClient, error) {
+func fakeFactory(n *int64) func() (*UpstreamClient, error) {
 	return func() (*UpstreamClient, error) {
-		*n++
+		atomic.AddInt64(n, 1)
 		return &UpstreamClient{serverName: "test"}, nil
 	}
 }
@@ -20,7 +21,7 @@ func fakeFactory(n *int) func() (*UpstreamClient, error) {
 // the SAME client instance (idle reuse keyed by serverUUID).
 func TestAcquireReleaseReusesIdle(t *testing.T) {
 	p := NewPool(10, 5, time.Minute)
-	var n int
+	var n int64
 	f := fakeFactory(&n)
 
 	c1, err := p.Acquire(context.Background(), "sess1", "srv1", f)
@@ -46,7 +47,7 @@ func TestAcquireReleaseReusesIdle(t *testing.T) {
 // serverName).
 func TestReleaseSessionKeysByIdleServerUUID(t *testing.T) {
 	p := NewPool(10, 5, time.Minute)
-	var n int
+	var n int64
 	f := fakeFactory(&n)
 
 	c1, err := p.Acquire(context.Background(), "sess1", "srv1", f)
@@ -72,7 +73,7 @@ func TestReleaseSessionKeysByIdleServerUUID(t *testing.T) {
 // each must not hand an in-use client to another caller. Run with -race.
 func TestConcurrentAcquireSameSessionServer(t *testing.T) {
 	p := NewPool(100, 20, time.Minute)
-	var n int
+	var n int64
 	f := fakeFactory(&n)
 
 	const workers = 10
@@ -136,7 +137,7 @@ func TestConcurrentAcquireSameSessionServer(t *testing.T) {
 // one server across ALL sessions, not per session.
 func TestPerServerCapIsGlobal(t *testing.T) {
 	p := NewPool(100, 3, time.Minute)
-	var n int
+	var n int64
 	f := fakeFactory(&n)
 
 	// Fill the cap from three different sessions.
@@ -158,7 +159,7 @@ func TestPerServerCapIsGlobal(t *testing.T) {
 // must NOT both pass the cap check (check-then-act race regression test).
 func TestCapReservationAtomic(t *testing.T) {
 	p := NewPool(10, 1, time.Minute)
-	var n int
+	var n int64
 	f := fakeFactory(&n)
 
 	var wg sync.WaitGroup
@@ -197,7 +198,7 @@ func TestFactoryFailureRollsBackReservation(t *testing.T) {
 		t.Fatalf("expected factory error")
 	}
 	// Cap must be free again.
-	var n int
+	var n int64
 	c, err := p.Acquire(context.Background(), "sess", "srv", fakeFactory(&n))
 	if err != nil {
 		t.Fatalf("acquire after failed factory: %v", err)
@@ -211,7 +212,7 @@ func TestFactoryFailureRollsBackReservation(t *testing.T) {
 // older than the TTL and keep fresh ones.
 func TestSweepExpiredClosesOnlyExpired(t *testing.T) {
 	p := NewPool(10, 5, 50*time.Millisecond)
-	var n int
+	var n int64
 	f := fakeFactory(&n)
 
 	c1, _ := p.Acquire(context.Background(), "s1", "srv", f)
