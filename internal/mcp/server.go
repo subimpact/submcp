@@ -445,6 +445,12 @@ func (s *Server) handleSSEMessage(w http.ResponseWriter, r *http.Request, ep *db
 
 	var result json.RawMessage
 	switch req.Method {
+	case "initialize":
+		// Legacy SSE clients also send initialize (the SDK transport
+		// handles it). Echo the negotiated version, tools-only
+		// capabilities (P1-10 parity with the streamable path).
+		init := s.handleInitialize(r.Context(), ep, req)
+		result, _ = json.Marshal(init)
 	case "tools/list":
 		tools, err := s.agg.ListTools(r.Context(), nsUUID)
 		if err != nil {
@@ -467,6 +473,12 @@ func (s *Server) handleSSEMessage(w http.ResponseWriter, r *http.Request, ep *db
 		result = json.RawMessage(`{}`)
 	default:
 		writeJSONError(w, http.StatusMethodNotAllowed, "method_not_found", "Method not found: "+req.Method)
+		return
+	}
+
+	// Notifications (no id) get 202 with an empty body (P1-8 parity).
+	if len(req.ID) == 0 || string(req.ID) == "null" {
+		w.WriteHeader(http.StatusAccepted)
 		return
 	}
 
