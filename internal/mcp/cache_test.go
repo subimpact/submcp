@@ -184,3 +184,62 @@ func TestCallToolRoutesViaMap(t *testing.T) {
 		t.Fatalf("upstream was never contacted")
 	}
 }
+
+// TestTitleOverrideAppliesTopLevel: an override title must land in the
+// tool's TOP-LEVEL title field (P1-2), not annotations.title; upstream
+// titles are dropped for mapped tools; override_annotations are merged.
+func TestTitleOverrideAppliesTopLevel(t *testing.T) {
+	upTitle := "Upstream Title"
+	up := newFakeUpstream([]Tool{{
+		Name: "alpha", Title: &upTitle,
+		InputSchema: json.RawMessage(`{"type":"object"}`),
+		Annotations: &ToolAnnotations{ReadOnlyHint: boolPtr(true)},
+	}})
+	defer up.close()
+
+	ovTitle := "Override Title"
+	ovAnn := json.RawMessage(`{"destructiveHint":true}`)
+	upstreamTool := db.Tool{Name: "alpha"}
+	mappings := []struct {
+		Mapping db.NamespaceToolMapping
+		Tool    db.Tool
+	}{{
+		Mapping: db.NamespaceToolMapping{
+			UUID: "m-1", NamespaceUUID: "ns-1", ToolUUID: "t-1",
+			MCPServerUUID: "srv-1", Status: db.ServerStatusActive,
+			OverrideTitle: &ovTitle, OverrideAnn: ovAnn,
+		},
+		Tool: upstreamTool,
+	}}
+
+	agg := NewAggregator(NewPool(10, 5, time.Minute), &fakeDB2{
+		servers: []db.MCPServer{fakeServerForTest(db.MCPServer{
+			UUID: "srv-1", Name: "fake", URL: &up.srv.URL,
+		})},
+		mappings: mappings,
+	})
+
+	ctx := context.Background()
+	tools, err := agg.ListTools(ctx, "ns-1")
+	if err != nil {
+		t.Fatalf("list: %v", err)
+	}
+	if len(tools) != 1 {
+		t.Fatalf("expected 1 tool, got %d", len(tools))
+	}
+	tool := tools[0]
+	if tool.Title == nil || *tool.Title != ovTitle {
+		t.Fatalf("override title must be top-level, got %+v", tool.Title)
+	}
+	if tool.Annotations == nil || tool.Annotations.ReadOnlyHint == nil || !*tool.Annotations.ReadOnlyHint {
+		t.Fatalf("upstream annotations must survive: %+v", tool.Annotations)
+	}
+	if tool.Annotations.DestructiveHint == nil || !*tool.Annotations.DestructiveHint {
+		t.Fatalf("override annotations must merge: %+v", tool.Annotations)
+	}
+	if tool.Annotations.Title != nil {
+		t.Fatalf("legacy annotations.title must be stripped: %+v", tool.Annotations.Title)
+	}
+}
+
+func boolPtr(b bool) *bool { return &b }

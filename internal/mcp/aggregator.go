@@ -191,14 +191,18 @@ func (a *Aggregator) ListTools(ctx context.Context, namespaceUUID string) ([]Too
 					if ov.OverrideDesc != nil {
 						t.Description = ov.OverrideDesc
 					}
-					if ov.OverrideTitle != nil && t.Annotations == nil {
-						t.Annotations = &ToolAnnotations{}
-					}
+					// P1-2: title override — top-level title, NOT
+					// annotations.title. Mapped tools drop the UPSTREAM
+					// title (parity with the original's wire output),
+					// but an override title is applied as top-level.
 					if ov.OverrideTitle != nil {
-						title := *ov.OverrideTitle
-						t.Annotations.Title = &title
+						t.Title = ov.OverrideTitle
+					} else {
+						t.Title = nil
 					}
-					// Strip legacy title hint from annotations.
+					// Strip legacy title hint from annotations (the
+					// original always removes it to avoid conflicting
+					// with the top-level title).
 					if t.Annotations != nil {
 						t.Annotations.Title = nil
 						if t.Annotations.Title == nil &&
@@ -209,11 +213,17 @@ func (a *Aggregator) ListTools(ctx context.Context, namespaceUUID string) ([]Too
 							t.Annotations = nil
 						}
 					}
-					// Mapped tools lose top-level title entirely (the
-					// original's Tool schema has no title field — it's
-					// dropped on serialization). Unmapped tools pass
-					// through untouched.
-					t.Title = nil
+					// Apply override_annotations (shallow merge, override
+					// wins — mirrors mergeAnnotations).
+					if len(ov.OverrideAnn) > 0 && string(ov.OverrideAnn) != "null" {
+						var ann map[string]any
+						if err := json.Unmarshal(ov.OverrideAnn, &ann); err == nil && len(ann) > 0 {
+							if t.Annotations == nil {
+								t.Annotations = &ToolAnnotations{}
+							}
+							applyAnnotationOverrides(t.Annotations, ann)
+						}
+					}
 				}
 				all = append(all, t)
 			}
@@ -398,6 +408,27 @@ func (a *Aggregator) fetchServerTools(ctx context.Context, s db.MCPServer, overr
 	// filter out override names, never fail the response on DB errors.
 	a.syncTools(ctx, s, tools, overrideNames)
 	return tools, nil
+}
+
+// applyAnnotationOverrides merges override annotation values into a tool's
+// annotations (shallow merge, override wins — mirrors the original's
+// mergeAnnotations). Unknown keys are ignored (the wire shape only carries
+// the known hint fields).
+func applyAnnotationOverrides(ann *ToolAnnotations, overrides map[string]any) {
+	if v, ok := overrides["readOnlyHint"].(bool); ok {
+		ann.ReadOnlyHint = &v
+	}
+	if v, ok := overrides["destructiveHint"].(bool); ok {
+		ann.DestructiveHint = &v
+	}
+	if v, ok := overrides["idempotentHint"].(bool); ok {
+		ann.IDempotentHint = &v
+	}
+	if v, ok := overrides["openWorldHint"].(bool); ok {
+		ann.OpenWorldHint = &v
+	}
+	// title in override_annotations is a legacy hint — the original
+	// strips it; we ignore it too (top-level title is the source of truth).
 }
 
 // prefixTools returns a copy of tools with names prefixed server__tool.
