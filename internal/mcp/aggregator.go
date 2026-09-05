@@ -24,6 +24,7 @@ type ToolStore interface {
 		Tool    db.Tool
 	}, error)
 	SyncTools(ctx context.Context, serverUUID string, tools []db.SyncToolInput) error
+	SetServerErrorStatus(ctx context.Context, uuid string, status db.ErrorStatus) error
 }
 
 // Aggregator fans out MCP requests to all upstreams in a namespace and
@@ -57,6 +58,12 @@ type Aggregator struct {
 	// P1-5: tools sync hash-gate.
 	syncMu     sync.Mutex
 	syncHashes map[string]string
+
+	// P1-6: per-server circuit breakers.
+	breakers map[string]*Breaker
+
+	// P1-6: metrics.
+	metrics *Metrics
 }
 
 const (
@@ -89,7 +96,21 @@ func NewAggregator(pool *Pool, dbPool ToolStore) *Aggregator {
 		inflight:   make(map[string]*sync.WaitGroup),
 		routes:     make(map[string]*nsRoute),
 		syncHashes: make(map[string]string),
+		breakers:   make(map[string]*Breaker),
+		metrics:    NewMetrics(pool),
 	}
+}
+
+// breaker returns (creating if needed) the circuit breaker for a server.
+func (a *Aggregator) breaker(serverUUID string) *Breaker {
+	a.syncMu.Lock()
+	defer a.syncMu.Unlock()
+	b, ok := a.breakers[serverUUID]
+	if !ok {
+		b = NewBreaker()
+		a.breakers[serverUUID] = b
+	}
+	return b
 }
 
 var nameSanitizeRe = regexp.MustCompile(`[^a-zA-Z0-9_-]`)
@@ -287,6 +308,15 @@ func (a *Aggregator) CallTool(ctx context.Context, namespaceUUID, sessionID, too
 		return nil, fmt.Errorf("server %q has no URL configured", target.Name)
 	}
 
+	// P1-6: circuit breaker — fail fast when the upstream is down.
+	b := a.breaker(target.UUID)
+	if !b.Allow() {
+		a.metrics.RecordFailure(target.UUID, b.State())
+		return nil, fmt.Errorf("server %q circuit open (breaker)", target.Name)
+	}
+	a.metrics.RecordCall(target.UUID, target.Name)
+	a.metrics.RecordState(target.UUID, b.State())
+
 	client, err := a.pool.Acquire(ctx, sessionID, target.UUID, func() (*UpstreamClient, error) {
 		cfg := UpstreamConfig{
 			Name:        target.Name,
@@ -302,11 +332,23 @@ func (a *Aggregator) CallTool(ctx context.Context, namespaceUUID, sessionID, too
 		return c, nil
 	})
 	if err != nil {
+		if b.Failure() {
+			a.quarantine(ctx, *target)
+		}
 		return nil, fmt.Errorf("acquire upstream %s: %w", target.Name, err)
 	}
 	defer a.pool.Release(sessionID, target.UUID, client)
 
-	return client.CallTool(ctx, originalName, args)
+	res, err := client.CallTool(ctx, originalName, args)
+	if err != nil {
+		if b.Failure() {
+			a.quarantine(ctx, *target)
+		}
+		return nil, err
+	}
+	b.Success()
+	a.unquarantine(ctx, *target)
+	return res, nil
 }
 
 // getServerTools returns PREFIXED tools for a server, using the 60s cache.
@@ -372,11 +414,20 @@ func (a *Aggregator) getServerTools(ctx context.Context, s db.MCPServer, overrid
 }
 
 // fetchServerTools fetches raw (unprefixed) tools from upstream and syncs
-// them to the DB (P1-5, hash-gated, non-fatal).
+// them to the DB (P1-5, hash-gated, non-fatal). Circuit-breaker guarded
+// (P1-6): when the breaker is open, the fetch fails fast and the server
+// is quarantined via error_status = ERROR.
 func (a *Aggregator) fetchServerTools(ctx context.Context, s db.MCPServer, overrideNames map[string]bool) ([]Tool, error) {
 	if s.URL == nil || *s.URL == "" {
 		return nil, fmt.Errorf("server %q has no URL configured", s.Name)
 	}
+	b := a.breaker(s.UUID)
+	if !b.Allow() {
+		a.metrics.RecordFailure(s.UUID, b.State())
+		return nil, fmt.Errorf("server %q circuit open (breaker)", s.Name)
+	}
+	a.metrics.RecordCall(s.UUID, s.Name)
+	a.metrics.RecordState(s.UUID, b.State())
 	// Use a per-call session id (pool handles reuse).
 	sessionID := "list-" + s.UUID
 	client, err := a.pool.Acquire(ctx, sessionID, s.UUID, func() (*UpstreamClient, error) {
@@ -394,20 +445,45 @@ func (a *Aggregator) fetchServerTools(ctx context.Context, s db.MCPServer, overr
 		return c, nil
 	})
 	if err != nil {
+		if b.Failure() {
+			a.quarantine(ctx, s)
+		}
 		return nil, err
 	}
 	defer a.pool.Release(sessionID, s.UUID, client)
 
 	tools, err := client.ListTools(ctx)
 	if err != nil {
+		if b.Failure() {
+			a.quarantine(ctx, s)
+		}
 		return nil, err
 	}
+	b.Success()
+	a.unquarantine(ctx, s)
 
 	// P1-5: persist discovered tools (hash-gated, non-fatal). Mirrors the
 	// original's proxy sync: only sync when the tool-name set changed,
 	// filter out override names, never fail the response on DB errors.
 	a.syncTools(ctx, s, tools, overrideNames)
 	return tools, nil
+}
+
+// quarantine marks a server ERROR in the DB (removes it from the active
+// fan-out). Non-fatal: DB errors are logged, the breaker still protects.
+func (a *Aggregator) quarantine(ctx context.Context, s db.MCPServer) {
+	if err := a.db.SetServerErrorStatus(ctx, s.UUID, db.ErrorStatusErr); err != nil {
+		slog.Warn("quarantine write failed", "server", s.Name, "err", err)
+		return
+	}
+	slog.Warn("server quarantined (circuit open)", "server", s.Name)
+}
+
+// unquarantine resets a server's error_status to NONE after recovery.
+func (a *Aggregator) unquarantine(ctx context.Context, s db.MCPServer) {
+	if err := a.db.SetServerErrorStatus(ctx, s.UUID, db.ErrorStatusNone); err != nil {
+		slog.Warn("unquarantine write failed", "server", s.Name, "err", err)
+	}
 }
 
 // applyAnnotationOverrides merges override annotation values into a tool's

@@ -101,6 +101,9 @@ func (f *fakeDB2) GetToolMappings(ctx context.Context, namespaceUUID string) ([]
 func (f *fakeDB2) SyncTools(ctx context.Context, serverUUID string, tools []db.SyncToolInput) error {
 	return nil
 }
+func (f *fakeDB2) SetServerErrorStatus(ctx context.Context, uuid string, status db.ErrorStatus) error {
+	return nil
+}
 
 func TestToolCacheHitsSecondList(t *testing.T) {
 	up := newFakeUpstream([]Tool{{Name: "alpha", InputSchema: json.RawMessage(`{"type":"object"}`)}})

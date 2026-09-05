@@ -357,6 +357,15 @@ func (p *Pool) DeleteServer(ctx context.Context, uuid string) error {
 	return err
 }
 
+// SetServerErrorStatus quarantines (ERROR) or un-quarantines (NONE) a
+// server. GetActiveServersForNamespace filters error_status = 'NONE', so
+// ERROR effectively removes the server from the fan-out until it recovers
+// (P1-6 circuit breaker integration).
+func (p *Pool) SetServerErrorStatus(ctx context.Context, uuid string, status ErrorStatus) error {
+	_, err := p.Exec(ctx, `UPDATE mcp_servers SET error_status = $2 WHERE uuid = $1`, uuid, status)
+	return err
+}
+
 // ListNamespaces returns all namespaces.
 func (p *Pool) ListNamespaces(ctx context.Context) ([]Namespace, error) {
 	rows, err := p.Query(ctx, `

@@ -19,6 +19,7 @@ import (
 type EndpointStore interface {
 	GetEndpointByName(ctx context.Context, name string) (*db.Endpoint, error)
 	ListEndpoints(ctx context.Context) ([]db.Endpoint, error)
+	Ping(ctx context.Context) error
 }
 
 // Server is the HTTP front for the MCP gateway.
@@ -34,6 +35,7 @@ type Server struct {
 	auth      *Auth
 	sessions  *SessionStore
 	startTime time.Time
+	limiter   *RateLimiter
 }
 
 // NewServer wires the HTTP server. sessionTTL is the downstream session
@@ -46,6 +48,7 @@ func NewServer(dbPool EndpointStore, agg *Aggregator, pool *Pool, auth *Auth, se
 		auth:      auth,
 		sessions:  NewSessionStore(sessionTTL),
 		startTime: time.Now(),
+		limiter:   NewRateLimiter(60, 60), // P1-6: 60 req/min per IP
 	}
 }
 
@@ -54,9 +57,38 @@ func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
 
 	mux.HandleFunc("/health", s.handleHealth)
+	mux.HandleFunc("/ready", s.handleReady)
 	mux.HandleFunc("/metamcp/", s.handleMetamcp)
+	if s.agg != nil && s.agg.metrics != nil {
+		mux.Handle("/metrics", s.agg.metrics.Handler())
+	}
 
-	return withCORS(mux)
+	return withCORS(s.limiter.Middleware(mux))
+}
+
+// handleReady reports readiness: PG ping (2s) + pool stats. Used by
+// orchestrators/load balancers to decide when to route traffic.
+func (s *Server) handleReady(w http.ResponseWriter, r *http.Request) {
+	ctx, cancel := context.WithTimeout(r.Context(), 2*time.Second)
+	defer cancel()
+	if err := s.db.Ping(ctx); err != nil {
+		writeJSONError(w, http.StatusServiceUnavailable, "not_ready", "database unreachable")
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]any{
+		"status": "ready",
+		"pool":   s.poolStats(),
+	})
+}
+
+// poolStats returns pool gauges for /ready and /health.
+func (s *Server) poolStats() map[string]any {
+	if s.pool == nil {
+		return map[string]any{}
+	}
+	idle, active := s.pool.Stats()
+	return map[string]any{"idle": idle, "active": active}
 }
 
 // withCORS enables browser MCP clients (P2-5a). Mirrors the original's
@@ -352,9 +384,16 @@ func (s *Server) handleStreamableGET(w http.ResponseWriter, r *http.Request, ep 
 	ctx := r.Context()
 	ticker := time.NewTicker(15 * time.Second)
 	defer ticker.Stop()
+	// P1-6 SSE stream cap: a client that never disconnects must not hold
+	// a session + pool connection forever. 24h is far beyond any real
+	// MCP client session.
+	deadline := time.NewTimer(sseStreamCap)
+	defer deadline.Stop()
 	for {
 		select {
 		case <-ctx.Done():
+			return
+		case <-deadline.C:
 			return
 		case <-ticker.C:
 			// Heartbeat comment keeps intermediaries from closing the stream.
@@ -363,6 +402,10 @@ func (s *Server) handleStreamableGET(w http.ResponseWriter, r *http.Request, ep 
 		}
 	}
 }
+
+// sseStreamCap bounds how long a streamable-GET SSE stream may live
+// (P1-6). 24h default; far beyond any real client session.
+const sseStreamCap = 24 * time.Hour
 
 // handleDelete terminates a session.
 func (s *Server) handleDelete(w http.ResponseWriter, r *http.Request, ep *db.Endpoint) {

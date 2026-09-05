@@ -29,6 +29,8 @@ func (f *fakeDB) ListEndpoints(_ context.Context) ([]db.Endpoint, error) {
 	return out, nil
 }
 
+func (f *fakeDB) Ping(_ context.Context) error { return nil }
+
 func newTestServer() *Server {
 	epA := &db.Endpoint{
 		UUID: "ep-a", Name: "a", NamespaceUUID: "ns-a",
