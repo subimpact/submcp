@@ -144,15 +144,38 @@ func (s *Server) handleMetamcp(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-// handleEndpointList mirrors the original unauthenticated enumeration.
+// handleEndpointList mirrors the original unauthenticated enumeration, but
+// strips sensitive fields (P1-17): user_id, namespace_uuid, and
+// enable_api_key_auth are NOT exposed to unauthenticated callers.
 func (s *Server) handleEndpointList(w http.ResponseWriter, r *http.Request) {
 	eps, err := s.db.ListEndpoints(r.Context())
 	if err != nil {
 		writeJSONError(w, http.StatusInternalServerError, "internal_error", "Database error")
 		return
 	}
+	type publicEndpoint struct {
+		UUID              string    `json:"uuid"`
+		Name              string    `json:"name"`
+		Description       *string   `json:"description"`
+		UseQueryParamAuth bool      `json:"use_query_param_auth"`
+		CreatedAt         time.Time `json:"created_at"`
+		UpdatedAt         time.Time `json:"updated_at"`
+		EnableOAuth       bool      `json:"enable_oauth"`
+	}
+	out := make([]publicEndpoint, 0, len(eps))
+	for _, e := range eps {
+		out = append(out, publicEndpoint{
+			UUID:              e.UUID,
+			Name:              e.Name,
+			Description:       e.Description,
+			UseQueryParamAuth: e.UseQueryParamAuth,
+			CreatedAt:         e.CreatedAt,
+			UpdatedAt:         e.UpdatedAt,
+			EnableOAuth:       e.EnableOAuth,
+		})
+	}
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]any{"endpoints": eps})
+	json.NewEncoder(w).Encode(map[string]any{"endpoints": out})
 }
 
 // handleStreamableHTTP implements the MCP streamable HTTP transport.

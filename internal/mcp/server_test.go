@@ -282,6 +282,29 @@ func TestCORSActualRequest(t *testing.T) {
 	}
 }
 
+// TestEndpointEnumerationStripsSensitive: the unauthenticated endpoint
+// list must NOT expose user_id, namespace_uuid, or enable_api_key_auth
+// (P1-17).
+func TestEndpointEnumerationStripsSensitive(t *testing.T) {
+	s := newTestServer()
+	req := httptest.NewRequest(http.MethodGet, "/metamcp/", nil)
+	rr := httptest.NewRecorder()
+	s.Handler().ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("enumeration must 200, got %d", rr.Code)
+	}
+	body := rr.Body.String()
+	for _, leaked := range []string{"user_id", "namespace_uuid", "enable_api_key_auth"} {
+		if strings.Contains(body, leaked) {
+			t.Fatalf("enumeration must not leak %q: %s", leaked, body)
+		}
+	}
+	if !strings.Contains(body, `"name":"a"`) {
+		t.Fatalf("enumeration must still list endpoint names: %s", body)
+	}
+}
+
 // TestAuthScoping: a key owned by user X must be rejected on an endpoint
 // owned by user Y (P0-6).
 func TestAuthScoping(t *testing.T) {
