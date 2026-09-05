@@ -122,7 +122,9 @@ func (c *UpstreamClient) Connect(ctx context.Context) error {
 	return nil
 }
 
-// ListTools calls tools/list on the upstream.
+// ListTools calls tools/list on the upstream, following nextCursor
+// pagination with a hard cap (P1-12) so a misbehaving upstream can't
+// loop forever.
 func (c *UpstreamClient) ListTools(ctx context.Context) ([]Tool, error) {
 	c.mu.Lock()
 	if !c.connected {
@@ -132,50 +134,64 @@ func (c *UpstreamClient) ListTools(ctx context.Context) ([]Tool, error) {
 	sid := c.sessionID
 	c.mu.Unlock()
 
-	body, _ := json.Marshal(map[string]any{
-		"jsonrpc": "2.0",
-		"id":      2,
-		"method":  "tools/list",
-		"params":  map[string]any{},
-	})
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.url, bytes.NewReader(body))
-	if err != nil {
-		return nil, err
-	}
-	c.applyHeaders(req)
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Accept", "application/json, text/event-stream")
-	if sid != "" {
-		req.Header.Set("mcp-session-id", sid)
-	}
+	const maxPages = 50 // P1-12 cap: 50 pages is far beyond any real tool list
+	var all []Tool
+	cursor := ""
+	for page := 0; page < maxPages; page++ {
+		params := map[string]any{}
+		if cursor != "" {
+			params["cursor"] = cursor
+		}
+		body, _ := json.Marshal(map[string]any{
+			"jsonrpc": "2.0",
+			"id":      2,
+			"method":  "tools/list",
+			"params":  params,
+		})
+		req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.url, bytes.NewReader(body))
+		if err != nil {
+			return nil, err
+		}
+		c.applyHeaders(req)
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("Accept", "application/json, text/event-stream")
+		if sid != "" {
+			req.Header.Set("mcp-session-id", sid)
+		}
 
-	resp, err := c.httpClient.Do(req)
-	if err != nil {
-		return nil, fmt.Errorf("tools/list %s: %w", c.serverName, err)
-	}
-	defer resp.Body.Close()
+		resp, err := c.httpClient.Do(req)
+		if err != nil {
+			return nil, fmt.Errorf("tools/list %s: %w", c.serverName, err)
+		}
+		if resp.StatusCode != http.StatusOK {
+			raw, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+			resp.Body.Close()
+			return nil, fmt.Errorf("tools/list %s: HTTP %d: %s", c.serverName, resp.StatusCode, truncate(string(raw), 300))
+		}
 
-	if resp.StatusCode != http.StatusOK {
-		raw, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
-		return nil, fmt.Errorf("tools/list %s: HTTP %d: %s", c.serverName, resp.StatusCode, truncate(string(raw), 300))
+		msg, err := readFirstSSEMessage(resp.Body, "2")
+		resp.Body.Close()
+		if err != nil {
+			return nil, err
+		}
+		var rpc Response
+		if err := json.Unmarshal(msg, &rpc); err != nil {
+			return nil, err
+		}
+		if rpc.Error != nil {
+			return nil, fmt.Errorf("tools/list %s: rpc error %d: %s", c.serverName, rpc.Error.Code, rpc.Error.Message)
+		}
+		var result ListToolsResult
+		if err := json.Unmarshal(rpc.Result, &result); err != nil {
+			return nil, err
+		}
+		all = append(all, result.Tools...)
+		if result.NextCursor == nil || *result.NextCursor == "" {
+			return all, nil
+		}
+		cursor = *result.NextCursor
 	}
-
-	msg, err := readFirstSSEMessage(resp.Body, "2")
-	if err != nil {
-		return nil, err
-	}
-	var rpc Response
-	if err := json.Unmarshal(msg, &rpc); err != nil {
-		return nil, err
-	}
-	if rpc.Error != nil {
-		return nil, fmt.Errorf("tools/list %s: rpc error %d: %s", c.serverName, rpc.Error.Code, rpc.Error.Message)
-	}
-	var result ListToolsResult
-	if err := json.Unmarshal(rpc.Result, &result); err != nil {
-		return nil, err
-	}
-	return result.Tools, nil
+	return nil, fmt.Errorf("tools/list %s: exceeded %d pagination pages", c.serverName, maxPages)
 }
 
 // CallTool calls tools/call on the upstream.
