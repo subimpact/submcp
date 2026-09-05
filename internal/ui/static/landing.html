@@ -1,0 +1,165 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>submcp - a lightweight MCP gateway</title>
+<meta name="description" content="submcp is a single-binary MCP gateway that aggregates multiple upstream MCP servers into one endpoint. 15 MB, Postgres-backed, embedded admin UI.">
+<link rel="stylesheet" href="/assets/landing.css">
+</head>
+<body>
+<header class="nav">
+  <div class="nav-inner">
+    <span class="brand">submcp</span>
+    <nav class="nav-links">
+      <a href="#features">Features</a>
+      <a href="#how">How it works</a>
+      <a href="#upstreams">Upstreams</a>
+      <a href="#support">Support</a>
+    </nav>
+    <a class="btn btn-ghost" href="/admin/">Admin</a>
+  </div>
+</header>
+
+<main>
+  <section class="hero">
+    <div class="hero-copy">
+      <h1>One endpoint.<br>Every MCP server.</h1>
+      <p class="hero-sub">submcp aggregates multiple MCP servers into a single gateway. One binary, one URL, every tool.</p>
+      <div class="hero-ctas">
+        <a class="btn btn-primary" href="https://github.com/subimpact/submcp">View on GitHub</a>
+        <a class="btn btn-ghost" href="/admin/">Open admin</a>
+      </div>
+    </div>
+    <div class="hero-stats" id="live-stats" aria-live="polite">
+      <div class="stat-block">
+        <div class="stat-num" id="stat-tools">-</div>
+        <div class="stat-label">tools exposed</div>
+      </div>
+      <div class="stat-block">
+        <div class="stat-num" id="stat-servers">-</div>
+        <div class="stat-label">upstreams</div>
+      </div>
+      <div class="stat-block">
+        <div class="stat-num">15 MB</div>
+        <div class="stat-label">single binary</div>
+      </div>
+      <div class="stat-block">
+        <div class="stat-num" id="stat-uptime">-</div>
+        <div class="stat-label">uptime</div>
+      </div>
+      <p class="stats-note">Live from this gateway</p>
+    </div>
+  </section>
+
+  <section class="features" id="features">
+    <h2>Built for the edge of the MCP ecosystem</h2>
+    <div class="feature-grid">
+      <div class="feature feature-wide">
+        <h3>One binary, no runtime</h3>
+        <p>A static Go binary with zero dependencies. No Node, no Python, no 1 GB container images. The Docker image is 15 MB.</p>
+      </div>
+      <div class="feature">
+        <h3>Multi-upstream fan-out</h3>
+        <p>One tools/list or tools/call fans out to every registered server. A dead upstream is skipped, the rest still respond.</p>
+      </div>
+      <div class="feature">
+        <h3>Namespaced tools</h3>
+        <p>Every tool is prefixed with its server: peecai__list_projects, tavily-1__tavily_search. No collisions, no confusion.</p>
+      </div>
+      <div class="feature">
+        <h3>Both transports</h3>
+        <p>Streamable HTTP and legacy SSE served from the same process. Clients that speak either protocol just work.</p>
+      </div>
+      <div class="feature">
+        <h3>Postgres-backed config</h3>
+        <p>Endpoints, namespaces, servers, tool mappings and API keys live in Postgres. The database is the contract.</p>
+      </div>
+      <div class="feature feature-wide">
+        <h3>Embedded admin UI</h3>
+        <p>A full management interface ships inside the binary. Add servers, toggle namespace mappings, test upstream connectivity, manage API keys. No separate frontend to deploy.</p>
+      </div>
+    </div>
+  </section>
+
+  <section class="how" id="how">
+    <h2>From zero to gateway in three commands</h2>
+    <ol class="steps">
+      <li>
+        <span class="step-num">1</span>
+        <h3>Install</h3>
+        <p>go build -o bin/submcp ./cmd/submcp, or pull the 15 MB Docker image.</p>
+      </li>
+      <li>
+        <span class="step-num">2</span>
+        <h3>Configure</h3>
+        <p>Point it at Postgres, add your upstream servers in the admin UI, and test each one live.</p>
+      </li>
+      <li>
+        <span class="step-num">3</span>
+        <h3>Connect</h3>
+        <p>Point any MCP client at /metamcp/all/mcp with an API key. Every tool from every server, one URL.</p>
+      </li>
+    </ol>
+  </section>
+
+  <section class="upstreams" id="upstreams">
+    <h2>Works with any MCP server</h2>
+    <p class="section-sub">This gateway is currently aggregating these upstreams in production.</p>
+    <ul class="upstream-list" id="upstream-list">
+      <li>Loading live upstreams...</li>
+    </ul>
+  </section>
+
+  <section class="support" id="support">
+    <h2>Keep the gateway running</h2>
+    <p class="section-sub">submcp is open source and free. If it saves you time, buy me a coffee.</p>
+    <a class="btn btn-primary" href="https://www.buymeacoffee.com/subimpact" target="_blank" rel="noopener">Buy me a coffee</a>
+  </section>
+</main>
+
+<footer>
+  <div class="footer-inner">
+    <span>submcp</span>
+    <a href="https://github.com/subimpact/submcp">GitHub</a>
+    <a href="/admin/">Admin</a>
+    <span class="footer-muted">MIT license</span>
+  </div>
+</footer>
+
+<script>
+(async function () {
+  try {
+    var res = await fetch("/api/public/stats");
+    var d = await res.json();
+    document.getElementById("stat-tools").textContent = d.tools;
+    document.getElementById("stat-servers").textContent = d.servers;
+    document.getElementById("stat-uptime").textContent = d.uptime;
+    var list = document.getElementById("upstream-list");
+    list.innerHTML = "";
+    d.upstreams.forEach(function (s) {
+      var li = document.createElement("li");
+      var name = document.createElement("span");
+      name.className = "upstream-name";
+      name.textContent = s.name;
+      var type = document.createElement("span");
+      type.className = "upstream-type";
+      type.textContent = s.type;
+      var status = document.createElement("span");
+      status.className = "upstream-status " + (s.error_status === "NONE" ? "ok" : "err");
+      status.textContent = s.error_status === "NONE" ? "healthy" : "error";
+      li.appendChild(name);
+      li.appendChild(type);
+      li.appendChild(status);
+      list.appendChild(li);
+    });
+  } catch (e) {
+    document.getElementById("stat-tools").textContent = "?";
+    document.getElementById("stat-servers").textContent = "?";
+    document.getElementById("stat-uptime").textContent = "?";
+    document.getElementById("upstream-list").innerHTML = "<li>Stats unavailable</li>";
+  }
+})();
+</script>
+</body>
+</html>
