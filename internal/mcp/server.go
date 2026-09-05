@@ -56,7 +56,31 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("/health", s.handleHealth)
 	mux.HandleFunc("/metamcp/", s.handleMetamcp)
 
-	return mux
+	return withCORS(mux)
+}
+
+// withCORS enables browser MCP clients (P2-5a). Mirrors the original's
+// cors({ origin: true, credentials: true, methods: [GET,POST,DELETE,OPTIONS],
+// allowedHeaders: [Content-Type, mcp-session-id, Authorization, X-API-Key] }).
+// Origin is echoed (NOT "*" — "*" with credentials is invalid per spec);
+// OPTIONS preflights are answered 204 with the allow headers.
+func withCORS(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		origin := r.Header.Get("Origin")
+		if origin != "" {
+			w.Header().Set("Access-Control-Allow-Origin", origin)
+			w.Header().Set("Vary", "Origin")
+			w.Header().Set("Access-Control-Allow-Credentials", "true")
+		}
+		if r.Method == http.MethodOptions {
+			w.Header().Set("Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS")
+			w.Header().Set("Access-Control-Allow-Headers", "Content-Type, mcp-session-id, Authorization, X-API-Key")
+			w.Header().Set("Access-Control-Max-Age", "86400")
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
 }
 
 func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {

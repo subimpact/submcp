@@ -240,6 +240,48 @@ func TestSessionTTLZeroNoExpiry(t *testing.T) {
 	}
 }
 
+// TestCORSPreflight: OPTIONS must return 204 with allow headers and echo
+// the origin (P2-5a).
+func TestCORSPreflight(t *testing.T) {
+	s := newTestServer()
+	req := httptest.NewRequest(http.MethodOptions, "/metamcp/a/mcp", nil)
+	req.Header.Set("Origin", "https://example.com")
+	req.Header.Set("Access-Control-Request-Method", "POST")
+	rr := httptest.NewRecorder()
+	s.Handler().ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusNoContent {
+		t.Fatalf("preflight must 204, got %d", rr.Code)
+	}
+	if got := rr.Header().Get("Access-Control-Allow-Origin"); got != "https://example.com" {
+		t.Fatalf("origin must be echoed, got %q", got)
+	}
+	if got := rr.Header().Get("Access-Control-Allow-Methods"); !strings.Contains(got, "POST") {
+		t.Fatalf("methods must include POST, got %q", got)
+	}
+	if got := rr.Header().Get("Access-Control-Allow-Headers"); !strings.Contains(got, "mcp-session-id") {
+		t.Fatalf("headers must include mcp-session-id, got %q", got)
+	}
+}
+
+// TestCORSActualRequest: a real request with Origin gets the echo header.
+func TestCORSActualRequest(t *testing.T) {
+	s := newTestServer()
+	req := httptest.NewRequest(http.MethodPost, "/metamcp/a/mcp",
+		strings.NewReader(`{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}`))
+	req.Header.Set("Origin", "https://example.com")
+	req.Header.Set("Content-Type", "application/json")
+	rr := httptest.NewRecorder()
+	s.Handler().ServeHTTP(rr, req)
+
+	if got := rr.Header().Get("Access-Control-Allow-Origin"); got != "https://example.com" {
+		t.Fatalf("origin must be echoed on actual request, got %q", got)
+	}
+	if got := rr.Header().Get("Access-Control-Allow-Credentials"); got != "true" {
+		t.Fatalf("credentials must be allowed, got %q", got)
+	}
+}
+
 // TestAuthScoping: a key owned by user X must be rejected on an endpoint
 // owned by user Y (P0-6).
 func TestAuthScoping(t *testing.T) {
