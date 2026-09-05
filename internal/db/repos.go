@@ -519,3 +519,75 @@ func (p *Pool) DeleteEndpoint(ctx context.Context, uuid string) error {
 	_, err := p.Exec(ctx, `DELETE FROM endpoints WHERE uuid = $1`, uuid)
 	return err
 }
+
+// SyncToolInput is a discovered tool to persist (mirrors the original's
+// ToolUpsertInput: name, description, inputSchema).
+type SyncToolInput struct {
+	Name        string
+	Description string
+	InputSchema json.RawMessage
+}
+
+// SyncTools persists discovered tools for a server: deletes tools no longer
+// advertised and upserts current ones on (mcp_server_uuid, name). Mirrors
+// tools.repo.ts syncTools (delete-obsolete then bulk upsert), but runs in a
+// transaction for atomicity (deliberate improvement, see DEVIATIONS.md).
+func (p *Pool) SyncTools(ctx context.Context, serverUUID string, tools []SyncToolInput) error {
+	tx, err := p.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback(ctx)
+
+	// Delete obsolete tools (not in the current list). Empty list = delete all.
+	if len(tools) == 0 {
+		if _, err := tx.Exec(ctx, `DELETE FROM tools WHERE mcp_server_uuid = $1`, serverUUID); err != nil {
+			return err
+		}
+	} else {
+		names := make([]string, len(tools))
+		for i, t := range tools {
+			names[i] = t.Name
+		}
+		if _, err := tx.Exec(ctx, `DELETE FROM tools WHERE mcp_server_uuid = $1 AND name != ALL($2)`, serverUUID, names); err != nil {
+			return err
+		}
+	}
+
+	// Upsert current tools.
+	for _, t := range tools {
+		if _, err := tx.Exec(ctx, `
+			INSERT INTO tools (name, description, tool_schema, mcp_server_uuid)
+			VALUES ($1, $2, $3, $4)
+			ON CONFLICT (mcp_server_uuid, name) DO UPDATE SET
+				description = excluded.description,
+				tool_schema = excluded.tool_schema,
+				updated_at = now()`,
+			t.Name, t.Description, normalizeToolSchema(t.InputSchema), serverUUID); err != nil {
+			return err
+		}
+	}
+	return tx.Commit(ctx)
+}
+
+// normalizeToolSchema mirrors the original's storage format: the inputSchema
+// with a guaranteed "type" field (inputSchema's own type wins, so a schema
+// that declares "type":"array" is stored as-is).
+func normalizeToolSchema(input json.RawMessage) json.RawMessage {
+	if len(input) == 0 {
+		return json.RawMessage(`{"type":"object"}`)
+	}
+	var m map[string]any
+	if err := json.Unmarshal(input, &m); err != nil {
+		return input
+	}
+	if _, ok := m["type"]; ok {
+		return input
+	}
+	m["type"] = "object"
+	b, err := json.Marshal(m)
+	if err != nil {
+		return input
+	}
+	return b
+}

@@ -2,8 +2,11 @@ package mcp
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"log/slog"
 	"regexp"
 	"sort"
 	"strings"
@@ -25,6 +28,11 @@ type Aggregator struct {
 	db     *db.Pool
 	mu     sync.Mutex
 	caches map[string]*nsCache
+
+	// Tools sync hash-gate (P1-5): serverUUID -> sha256 of sorted tool
+	// names. Mirrors tools-sync-cache.ts — only sync when names changed.
+	syncMu     sync.Mutex
+	syncHashes map[string]string
 }
 
 type nsCache struct {
@@ -35,9 +43,10 @@ type nsCache struct {
 // NewAggregator creates the fan-out engine.
 func NewAggregator(pool *Pool, dbPool *db.Pool) *Aggregator {
 	return &Aggregator{
-		pool:   pool,
-		db:     dbPool,
-		caches: make(map[string]*nsCache),
+		pool:       pool,
+		db:         dbPool,
+		caches:     make(map[string]*nsCache),
+		syncHashes: make(map[string]string),
 	}
 }
 
@@ -78,10 +87,19 @@ func (a *Aggregator) ListTools(ctx context.Context, namespaceUUID string) ([]Too
 	type mapKey struct{ server, tool string }
 	overrideByKey := make(map[mapKey]db.NamespaceToolMapping)
 	activeByKey := make(map[mapKey]bool)
+	// Override names per server (P1-5 sync filter: tools whose name IS an
+	// override name are not persisted — they'd duplicate the original).
+	overrideNamesByServer := make(map[string]map[string]bool)
 	for _, m := range mappings {
 		k := mapKey{m.Mapping.MCPServerUUID, m.Tool.Name}
 		overrideByKey[k] = m.Mapping
 		activeByKey[k] = m.Mapping.Status == db.ServerStatusActive
+		if m.Mapping.OverrideName != nil {
+			if overrideNamesByServer[m.Mapping.MCPServerUUID] == nil {
+				overrideNamesByServer[m.Mapping.MCPServerUUID] = map[string]bool{}
+			}
+			overrideNamesByServer[m.Mapping.MCPServerUUID][*m.Mapping.OverrideName] = true
+		}
 	}
 
 	var (
@@ -97,7 +115,7 @@ func (a *Aggregator) ListTools(ctx context.Context, namespaceUUID string) ([]Too
 		wg.Add(1)
 		go func(s db.MCPServer) {
 			defer wg.Done()
-			tools, err := a.listFromServer(ctx, s)
+			tools, err := a.listFromServer(ctx, s, overrideNamesByServer[s.UUID])
 			if err != nil {
 				mu.Lock()
 				errs = append(errs, fmt.Sprintf("%s: %v", s.Name, err))
@@ -212,7 +230,7 @@ func (a *Aggregator) CallTool(ctx context.Context, namespaceUUID, sessionID, too
 	return client.CallTool(ctx, originalName, args)
 }
 
-func (a *Aggregator) listFromServer(ctx context.Context, s db.MCPServer) ([]Tool, error) {
+func (a *Aggregator) listFromServer(ctx context.Context, s db.MCPServer, overrideNames map[string]bool) ([]Tool, error) {
 	if s.URL == nil || *s.URL == "" {
 		return nil, fmt.Errorf("server %q has no URL configured", s.Name)
 	}
@@ -242,11 +260,73 @@ func (a *Aggregator) listFromServer(ctx context.Context, s db.MCPServer) ([]Tool
 		return nil, err
 	}
 
+	// P1-5: persist discovered tools (hash-gated, non-fatal). Mirrors the
+	// original's proxy sync: only sync when the tool-name set changed,
+	// filter out override names, never fail the response on DB errors.
+	a.syncTools(ctx, s, tools, overrideNames)
+
 	// Prefix tool names.
 	for i := range tools {
 		tools[i].Name = ToolName(s.Name, tools[i].Name)
 	}
 	return tools, nil
+}
+
+// toolNamesHash mirrors tools-sync-cache.ts: sha256 of the sorted names
+// joined with "|". Order-independent and stable — the sync gate.
+func toolNamesHash(names []string) string {
+	sorted := make([]string, len(names))
+	copy(sorted, names)
+	sort.Strings(sorted)
+	h := sha256.Sum256([]byte(strings.Join(sorted, "|")))
+	return hex.EncodeToString(h[:])
+}
+
+// syncTools persists discovered tools for a server. Hash-gated on the sorted
+// tool-name set (sha256, in-memory) so unchanged servers skip DB writes;
+// override-named tools are filtered out (they'd duplicate the original);
+// DB errors are logged and swallowed — tools/list must never fail because
+// persistence failed (the original's behavior).
+func (a *Aggregator) syncTools(ctx context.Context, s db.MCPServer, tools []Tool, overrideNames map[string]bool) {
+	names := make([]string, len(tools))
+	for i, t := range tools {
+		names[i] = t.Name
+	}
+	hashHex := toolNamesHash(names)
+
+	a.syncMu.Lock()
+	if a.syncHashes[s.UUID] == hashHex {
+		a.syncMu.Unlock()
+		return
+	}
+	a.syncMu.Unlock()
+
+	// Filter out tools whose name is an override name for this server
+	// (the original's filterOutOverrideTools; fail-safe: persist on doubt).
+	toSave := make([]db.SyncToolInput, 0, len(tools))
+	for _, t := range tools {
+		if overrideNames != nil && overrideNames[t.Name] {
+			continue
+		}
+		desc := ""
+		if t.Description != nil {
+			desc = *t.Description
+		}
+		toSave = append(toSave, db.SyncToolInput{
+			Name:        t.Name,
+			Description: desc,
+			InputSchema: t.InputSchema,
+		})
+	}
+
+	if err := a.db.SyncTools(ctx, s.UUID, toSave); err != nil {
+		slog.Warn("tools sync failed", "server", s.Name, "err", err)
+		return
+	}
+
+	a.syncMu.Lock()
+	a.syncHashes[s.UUID] = hashHex
+	a.syncMu.Unlock()
 }
 
 func (a *Aggregator) getServers(ctx context.Context, namespaceUUID string) ([]db.MCPServer, error) {
