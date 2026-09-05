@@ -44,6 +44,11 @@ func New(dbPool *db.Pool) *UI {
 	return &UI{db: dbPool, sessions: newSessionStore(), start: time.Now()}
 }
 
+// SweepSessions removes expired admin sessions (P1-4).
+func (u *UI) SweepSessions() {
+	u.sessions.sweep()
+}
+
 // Handler returns the UI's http.Handler (mounted at /).
 func (u *UI) Handler() http.Handler {
 	mux := http.NewServeMux()
@@ -193,6 +198,18 @@ func (s *sessionStore) destroy(token string) {
 	s.mu.Lock()
 	delete(s.sessions, token)
 	s.mu.Unlock()
+}
+
+// sweep removes expired admin sessions (P1-4: admin sessionStore sweep).
+func (s *sessionStore) sweep() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	now := time.Now()
+	for token, sess := range s.sessions {
+		if now.After(sess.expires) {
+			delete(s.sessions, token)
+		}
+	}
 }
 
 // --- auth helpers ---

@@ -56,7 +56,7 @@ func main() {
 	pool := mcp.NewPool(cfg.MaxTotalConns, cfg.MaxConnsPerServer, 5*time.Minute)
 	agg := mcp.NewAggregator(pool, dbPool)
 	auth := mcp.NewAuth(dbPool)
-	srv := mcp.NewServer(dbPool, agg, pool, auth)
+	srv := mcp.NewServer(dbPool, agg, pool, auth, cfg.SessionLifetime)
 
 	// Admin UI (embedded, mounted at /).
 	adminUI := ui.New(dbPool)
@@ -71,12 +71,16 @@ func main() {
 	// client IP, and a request ID for correlation.
 	handler := withRequestLogging(logger, root)
 
-	// Idle sweep.
+	// Idle sweep + session TTL sweep (P1-4).
 	go func() {
 		ticker := time.NewTicker(2 * time.Minute)
 		defer ticker.Stop()
 		for range ticker.C {
 			pool.SweepExpired()
+			for _, sid := range srv.SweepSessions() {
+				pool.ReleaseSession(sid)
+			}
+			adminUI.SweepSessions()
 		}
 	}()
 

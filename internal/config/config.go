@@ -39,7 +39,7 @@ func Get() *Config {
 		PostgresDB:        getEnv("POSTGRES_DB", "metamcp_db"),
 		MCPTimeout:        getEnvDur("MCP_TIMEOUT", 60*time.Second),
 		MCPMaxAttempts:    getEnvInt("MCP_MAX_ATTEMPTS", 1),
-		SessionLifetime:   getEnvDur("SESSION_LIFETIME", 0),
+		SessionLifetime:   getEnvDur("SESSION_LIFETIME", time.Hour),
 		MaxTotalConns:     getEnvInt("MAX_TOTAL_CONNECTIONS", 100),
 		MaxConnsPerServer: getEnvInt("MAX_CONNECTIONS_PER_SERVER", 20),
 		LogLevel:          getEnv("LOG_LEVEL", "info"),

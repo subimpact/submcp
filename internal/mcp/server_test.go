@@ -39,7 +39,7 @@ func newTestServer() *Server {
 		EnableAPIKeyAuth: false,
 	}
 	fdb := &fakeDB{endpoints: map[string]*db.Endpoint{"a": epA, "b": epB}}
-	s := NewServer(fdb, nil, NewPool(10, 5, time.Minute), nil)
+	s := NewServer(fdb, nil, NewPool(10, 5, time.Minute), nil, time.Hour)
 	return s
 }
 
@@ -196,6 +196,47 @@ func TestInitializeFallsBackOnUnknownVersion(t *testing.T) {
 	}
 	if !strings.Contains(rr.Body.String(), `"protocolVersion":"2025-03-26"`) {
 		t.Fatalf("expected fallback version, got: %s", rr.Body.String())
+	}
+}
+
+// TestSessionTTLExpires: a session older than the TTL must be rejected by
+// Get and removed by Sweep (P1-4).
+func TestSessionTTLExpires(t *testing.T) {
+	store := NewSessionStore(50 * time.Millisecond)
+	store.Put("s1", "ns-a", "ep-a")
+
+	// Fresh: valid.
+	if _, ok := store.Get("s1", "ep-a"); !ok {
+		t.Fatalf("fresh session must be valid")
+	}
+
+	time.Sleep(80 * time.Millisecond)
+
+	// Expired: Get must reject (lazy expiry).
+	if _, ok := store.Get("s1", "ep-a"); ok {
+		t.Fatalf("expired session must be rejected by Get")
+	}
+
+	// Sweep must return the remaining expired id (s1 was already removed
+	// lazily by the Get above).
+	store.Put("s2", "ns-a", "ep-a")
+	time.Sleep(80 * time.Millisecond)
+	expired := store.Sweep()
+	if len(expired) != 1 || expired[0] != "s2" {
+		t.Fatalf("sweep must return the remaining expired session, got %v", expired)
+	}
+}
+
+// TestSessionTTLZeroNoExpiry: TTL 0 means no expiry (P1-4 explicit opt-out).
+func TestSessionTTLZeroNoExpiry(t *testing.T) {
+	store := NewSessionStore(0)
+	store.Put("s1", "ns-a", "ep-a")
+	time.Sleep(20 * time.Millisecond)
+	if _, ok := store.Get("s1", "ep-a"); !ok {
+		t.Fatalf("TTL 0 must never expire")
+	}
+	if expired := store.Sweep(); len(expired) != 0 {
+		t.Fatalf("TTL 0 sweep must be a no-op, got %v", expired)
 	}
 }
 

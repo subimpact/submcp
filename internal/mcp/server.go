@@ -36,14 +36,15 @@ type Server struct {
 	startTime time.Time
 }
 
-// NewServer wires the HTTP server.
-func NewServer(dbPool EndpointStore, agg *Aggregator, pool *Pool, auth *Auth) *Server {
+// NewServer wires the HTTP server. sessionTTL is the downstream session
+// lifetime (0 = no expiry; P1-4 default 1h).
+func NewServer(dbPool EndpointStore, agg *Aggregator, pool *Pool, auth *Auth, sessionTTL time.Duration) *Server {
 	return &Server{
 		db:        dbPool,
 		agg:       agg,
 		pool:      pool,
 		auth:      auth,
-		sessions:  NewSessionStore(),
+		sessions:  NewSessionStore(sessionTTL),
 		startTime: time.Now(),
 	}
 }
@@ -273,6 +274,12 @@ var supportedProtocolVersions = map[string]bool{
 	"2025-06-18": true,
 }
 
+// SweepSessions removes expired downstream sessions and returns their IDs
+// so the caller can release pool clients (P1-4).
+func (s *Server) SweepSessions() []string {
+	return s.sessions.Sweep()
+}
+
 // handleStreamableGET opens an SSE stream for an existing session.
 func (s *Server) handleStreamableGET(w http.ResponseWriter, r *http.Request, ep *db.Endpoint) {
 	sessionID := r.Header.Get("mcp-session-id")
@@ -468,33 +475,43 @@ func writeJSONError(w http.ResponseWriter, status int, code, msg string) {
 // Sessions are bound to the endpoint they were created on so a session
 // from one endpoint cannot be replayed against another (cross-tenant
 // isolation — security fix).
+//
+// P1-4: sessions carry a TTL (default 1h). Expiry is enforced lazily on
+// Get and eagerly by Sweep (which also releases the session's pool
+// clients). TTL 0 = no expiry (only when explicitly configured).
 type SessionStore struct {
 	mu       sync.Mutex
 	sessions map[string]sessionInfo // sessionID -> info
+	ttl      time.Duration
 }
 
 type sessionInfo struct {
 	namespaceUUID string
 	endpointUUID  string
+	createdAt     time.Time
 }
 
-func NewSessionStore() *SessionStore {
-	return &SessionStore{sessions: make(map[string]sessionInfo)}
+func NewSessionStore(ttl time.Duration) *SessionStore {
+	return &SessionStore{sessions: make(map[string]sessionInfo), ttl: ttl}
 }
 
 func (s *SessionStore) Put(sessionID, nsUUID, epUUID string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.sessions[sessionID] = sessionInfo{namespaceUUID: nsUUID, endpointUUID: epUUID}
+	s.sessions[sessionID] = sessionInfo{namespaceUUID: nsUUID, endpointUUID: epUUID, createdAt: time.Now()}
 }
 
 // Get returns the namespace for a session if it exists AND was created on
-// the given endpoint. Returns ok=false on any mismatch.
+// the given endpoint AND has not expired. Returns ok=false on any mismatch.
 func (s *SessionStore) Get(sessionID, epUUID string) (string, bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	info, ok := s.sessions[sessionID]
 	if !ok || info.endpointUUID != epUUID {
+		return "", false
+	}
+	if s.ttl > 0 && time.Since(info.createdAt) > s.ttl {
+		delete(s.sessions, sessionID)
 		return "", false
 	}
 	return info.namespaceUUID, true
@@ -504,4 +521,23 @@ func (s *SessionStore) Delete(sessionID string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	delete(s.sessions, sessionID)
+}
+
+// Sweep removes expired sessions and returns their IDs so the caller can
+// release pool clients. No-op when TTL is 0.
+func (s *SessionStore) Sweep() []string {
+	if s.ttl <= 0 {
+		return nil
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	var expired []string
+	now := time.Now()
+	for id, info := range s.sessions {
+		if now.Sub(info.createdAt) > s.ttl {
+			delete(s.sessions, id)
+			expired = append(expired, id)
+		}
+	}
+	return expired
 }
