@@ -19,12 +19,12 @@ type Pool struct {
 }
 
 // Connect establishes a Postgres connection pool.
-func Connect(ctx context.Context, host, port, user, password, dbname string) (*Pool, error) {
+func Connect(ctx context.Context, host, port, user, password, dbname, sslmode string) (*Pool, error) {
 	// Key/value DSN form (P1-13): avoids URL-encoding issues with special
 	// characters in the password, and keeps the password out of a URL
 	// string that could appear in error messages.
-	dsn := fmt.Sprintf("host=%s port=%s user=%s password=%s dbname=%s sslmode=disable pool_max_conns=10",
-		host, port, user, password, dbname)
+	dsn := fmt.Sprintf("host=%s port=%s user=%s password=%s dbname=%s sslmode=%s pool_max_conns=10",
+		host, port, user, password, dbname, sslmode)
 	cfg, err := pgxpool.ParseConfig(dsn)
 	if err != nil {
 		return nil, fmt.Errorf("parse dsn: %w", err)

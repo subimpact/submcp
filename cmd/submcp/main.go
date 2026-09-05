@@ -39,7 +39,7 @@ func main() {
 
 	// Connect to Postgres (the same DB the gateway has always used).
 	dbPool, err := db.Connect(ctx, cfg.PostgresHost, cfg.PostgresPort,
-		cfg.PostgresUser, cfg.PostgresPassword, cfg.PostgresDB)
+		cfg.PostgresUser, cfg.PostgresPassword, cfg.PostgresDB, cfg.PostgresSSLMode)
 	if err != nil {
 		log.Fatalf("postgres: %v", err)
 	}

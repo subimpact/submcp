@@ -17,6 +17,7 @@ type Config struct {
 	PostgresUser     string
 	PostgresPassword string
 	PostgresDB       string
+	PostgresSSLMode  string // disable | require | verify-full (default disable)
 
 	// MCP behavior (config table defaults)
 	MCPTimeout       time.Duration // default 60s
@@ -37,6 +38,7 @@ func Get() *Config {
 		PostgresUser:      getEnv("POSTGRES_USER", "postgres"),
 		PostgresPassword:  getEnv("POSTGRES_PASSWORD", ""),
 		PostgresDB:        getEnv("POSTGRES_DB", "metamcp_db"),
+		PostgresSSLMode:   getEnv("POSTGRES_SSLMODE", "disable"),
 		MCPTimeout:        getEnvDur("MCP_TIMEOUT", 60*time.Second),
 		MCPMaxAttempts:    getEnvInt("MCP_MAX_ATTEMPTS", 1),
 		SessionLifetime:   getEnvDur("SESSION_LIFETIME", time.Hour),
