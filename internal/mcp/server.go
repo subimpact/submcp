@@ -176,16 +176,21 @@ func (s *Server) handlePost(w http.ResponseWriter, r *http.Request, ep *db.Endpo
 
 	// Session handling.
 	sessionID := r.Header.Get("mcp-session-id")
-	if sessionID == "" {
-		// New session: generate one and return it.
-		sessionID = newUUID()
-	}
 
 	// JSON-RPC notifications (no id) must NOT receive a response (P1-8).
 	// Per the streamable HTTP spec, return 202 Accepted with an empty
 	// body for notification-only POSTs.
 	if len(req.ID) == 0 || string(req.ID) == "null" {
 		w.WriteHeader(http.StatusAccepted)
+		return
+	}
+
+	// P2-6: non-initialize requests MUST carry a session id. Inventing a
+	// UUID here would produce a misleading 404 "Session not found" for a
+	// client that never initialized — a 400 is the honest answer.
+	if sessionID == "" && req.Method != "initialize" {
+		writeJSONError(w, http.StatusBadRequest, "missing_session",
+			"mcp-session-id header is required for non-initialize requests")
 		return
 	}
 

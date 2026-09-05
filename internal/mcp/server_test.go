@@ -154,6 +154,19 @@ func TestNotificationGetsNoResponse(t *testing.T) {
 	}
 }
 
+// TestMissingSessionIDOnNonInitialize: tools/list without a session id must
+// 400 (P2-6), not invent a UUID and 404.
+func TestMissingSessionIDOnNonInitialize(t *testing.T) {
+	s := newTestServer()
+	rr := doPost(t, s, "/metamcp/a/mcp", "", `{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}`)
+	if rr.Code != http.StatusBadRequest {
+		t.Fatalf("missing session on tools/list must 400, got %d", rr.Code)
+	}
+	if !strings.Contains(rr.Body.String(), "missing_session") {
+		t.Fatalf("expected missing_session error, got: %s", rr.Body.String())
+	}
+}
+
 // TestAuthScoping: a key owned by user X must be rejected on an endpoint
 // owned by user Y (P0-6).
 func TestAuthScoping(t *testing.T) {
