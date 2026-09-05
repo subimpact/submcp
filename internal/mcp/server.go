@@ -13,6 +13,14 @@ import (
 	"github.com/subimpact/submcp/internal/db"
 )
 
+// EndpointStore is the subset of the DB the server needs. Extracted as an
+// interface (P2-10) so handlers can be tested with httptest and fakes
+// instead of a live Postgres.
+type EndpointStore interface {
+	GetEndpointByName(ctx context.Context, name string) (*db.Endpoint, error)
+	ListEndpoints(ctx context.Context) ([]db.Endpoint, error)
+}
+
 // Server is the HTTP front for the MCP gateway.
 // Serves:
 //   - POST/GET/DELETE /metamcp/:endpoint/mcp  (streamable HTTP)
@@ -20,7 +28,7 @@ import (
 //   - POST /metamcp/:endpoint/message         (SSE message endpoint)
 //   - GET  /health
 type Server struct {
-	db        *db.Pool
+	db        EndpointStore
 	agg       *Aggregator
 	pool      *Pool
 	auth      *Auth
@@ -29,7 +37,7 @@ type Server struct {
 }
 
 // NewServer wires the HTTP server.
-func NewServer(dbPool *db.Pool, agg *Aggregator, pool *Pool, auth *Auth) *Server {
+func NewServer(dbPool EndpointStore, agg *Aggregator, pool *Pool, auth *Auth) *Server {
 	return &Server{
 		db:        dbPool,
 		agg:       agg,
@@ -139,13 +147,15 @@ func (s *Server) handleStreamableHTTP(w http.ResponseWriter, r *http.Request, ep
 }
 
 // writeSessionNotFound writes the exact fixture shape for an unknown session.
+// The available_sessions field is kept for wire-shape parity but always
+// returns an empty list (never leaks live session IDs — security fix).
 func (s *Server) writeSessionNotFound(w http.ResponseWriter, sessionID string) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusNotFound)
 	json.NewEncoder(w).Encode(map[string]any{
 		"error":             "Session not found",
 		"message":           fmt.Sprintf("Transport not found for sessionId %s", sessionID),
-		"available_sessions": s.sessions.List(),
+		"available_sessions": []string{},
 		"timestamp":         time.Now().UTC().Format("2006-01-02T15:04:05.000Z"),
 	})
 }
@@ -171,14 +181,27 @@ func (s *Server) handlePost(w http.ResponseWriter, r *http.Request, ep *db.Endpo
 		sessionID = newUUID()
 	}
 
+	// JSON-RPC notifications (no id) must NOT receive a response (P1-8).
+	// Per the streamable HTTP spec, return 202 Accepted with an empty
+	// body for notification-only POSTs.
+	if len(req.ID) == 0 || string(req.ID) == "null" {
+		w.WriteHeader(http.StatusAccepted)
+		return
+	}
+
 	switch req.Method {
 	case "initialize":
+		// Always mint a fresh session ID on initialize. Never trust a
+		// client-supplied mcp-session-id header here: rebinding an
+		// existing session to a different endpoint is a hijack vector
+		// (P0-1).
+		sessionID = newUUID()
 		result := s.handleInitialize(r.Context(), ep)
-		s.sessions.Put(sessionID, ep.NamespaceUUID)
+		s.sessions.Put(sessionID, ep.NamespaceUUID, ep.UUID)
 		w.Header().Set("mcp-session-id", sessionID)
 		writeSSE(w, r, newResponse(req.ID, result, nil))
 	case "tools/list":
-		nsUUID, ok := s.sessions.Get(sessionID)
+		nsUUID, ok := s.sessions.Get(sessionID, ep.UUID)
 		if !ok {
 			s.writeSessionNotFound(w, sessionID)
 			return
@@ -190,7 +213,7 @@ func (s *Server) handlePost(w http.ResponseWriter, r *http.Request, ep *db.Endpo
 		}
 		writeSSE(w, r, newResponse(req.ID, map[string]any{"tools": tools}, nil))
 	case "tools/call":
-		nsUUID, ok := s.sessions.Get(sessionID)
+		nsUUID, ok := s.sessions.Get(sessionID, ep.UUID)
 		if !ok {
 			s.writeSessionNotFound(w, sessionID)
 			return
@@ -234,7 +257,7 @@ func (s *Server) handleStreamableGET(w http.ResponseWriter, r *http.Request, ep 
 		writeJSONError(w, http.StatusBadRequest, "bad_request", "Missing mcp-session-id header")
 		return
 	}
-	if _, ok := s.sessions.Get(sessionID); !ok {
+	if _, ok := s.sessions.Get(sessionID, ep.UUID); !ok {
 		s.writeSessionNotFound(w, sessionID)
 		return
 	}
@@ -271,6 +294,12 @@ func (s *Server) handleDelete(w http.ResponseWriter, r *http.Request, ep *db.End
 		writeJSONError(w, http.StatusBadRequest, "bad_request", "Missing mcp-session-id header")
 		return
 	}
+	// Endpoint check: a caller may only delete a session that belongs to
+	// the endpoint they are authenticated against (P0-1).
+	if _, ok := s.sessions.Get(sessionID, ep.UUID); !ok {
+		s.writeSessionNotFound(w, sessionID)
+		return
+	}
 	s.sessions.Delete(sessionID)
 	s.pool.ReleaseSession(sessionID)
 	w.WriteHeader(http.StatusOK)
@@ -289,7 +318,7 @@ func (s *Server) handleSSE(w http.ResponseWriter, r *http.Request, ep *db.Endpoi
 	w.Header().Set("Connection", "keep-alive")
 
 	sessionID := newUUID()
-	s.sessions.Put(sessionID, ep.NamespaceUUID)
+	s.sessions.Put(sessionID, ep.NamespaceUUID, ep.UUID)
 
 	// Emit the endpoint event (parity with captured fixture).
 	msgURL := fmt.Sprintf("/metamcp/%s/message?sessionId=%s", ep.Name, sessionID)
@@ -320,7 +349,7 @@ func (s *Server) handleSSEMessage(w http.ResponseWriter, r *http.Request, ep *db
 		writeJSONError(w, http.StatusBadRequest, "bad_request", "Missing sessionId query param")
 		return
 	}
-	nsUUID, ok := s.sessions.Get(sessionID)
+	nsUUID, ok := s.sessions.Get(sessionID, ep.UUID)
 	if !ok {
 		s.writeSessionNotFound(w, sessionID)
 		return
@@ -412,42 +441,44 @@ func writeJSONError(w http.ResponseWriter, status int, code, msg string) {
 	})
 }
 
-// SessionStore tracks downstream sessions -> namespace.
+// SessionStore tracks downstream sessions -> namespace + endpoint.
+// Sessions are bound to the endpoint they were created on so a session
+// from one endpoint cannot be replayed against another (cross-tenant
+// isolation — security fix).
 type SessionStore struct {
 	mu       sync.Mutex
-	sessions map[string]string // sessionID -> namespaceUUID
+	sessions map[string]sessionInfo // sessionID -> info
+}
+
+type sessionInfo struct {
+	namespaceUUID string
+	endpointUUID  string
 }
 
 func NewSessionStore() *SessionStore {
-	return &SessionStore{sessions: make(map[string]string)}
+	return &SessionStore{sessions: make(map[string]sessionInfo)}
 }
 
-func (s *SessionStore) Put(sessionID, nsUUID string) {
+func (s *SessionStore) Put(sessionID, nsUUID, epUUID string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.sessions[sessionID] = nsUUID
+	s.sessions[sessionID] = sessionInfo{namespaceUUID: nsUUID, endpointUUID: epUUID}
 }
 
-func (s *SessionStore) Get(sessionID string) (string, bool) {
+// Get returns the namespace for a session if it exists AND was created on
+// the given endpoint. Returns ok=false on any mismatch.
+func (s *SessionStore) Get(sessionID, epUUID string) (string, bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	ns, ok := s.sessions[sessionID]
-	return ns, ok
+	info, ok := s.sessions[sessionID]
+	if !ok || info.endpointUUID != epUUID {
+		return "", false
+	}
+	return info.namespaceUUID, true
 }
 
 func (s *SessionStore) Delete(sessionID string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	delete(s.sessions, sessionID)
-}
-
-// List returns all active session IDs (for the 404 available_sessions field).
-func (s *SessionStore) List() []string {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	out := make([]string, 0, len(s.sessions))
-	for id := range s.sessions {
-		out = append(out, id)
-	}
-	return out
 }

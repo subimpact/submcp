@@ -9,8 +9,11 @@ import (
 // Pool manages upstream connections per server UUID, with idle reuse and
 // per-server caps. Mirrors mcp-server-pool.ts semantics:
 //   - idle sessions keyed by server UUID (reused across downstream sessions)
-//   - active sessions keyed by downstream sessionId -> serverUuid -> client
-//   - maxTotalConnections and maxConnectionsPerServer caps
+//   - active sessions keyed by downstream sessionId -> serverUuid -> stack
+//     (a stack, not a single slot, so concurrent tool calls to the same
+//     upstream from one session each get their own connection)
+//   - maxTotalConnections and maxConnectionsPerServer caps (per-server cap
+//     is global across all sessions, not per-session)
 //   - 5-minute idle expiry sweep
 type Pool struct {
 	mu sync.Mutex
@@ -21,8 +24,11 @@ type Pool struct {
 
 	// idle[serverUUID] = stack of idle clients
 	idle map[string][]*pooledClient
-	// active[downstreamSessionID][serverUUID] = client
-	active map[string]map[string]*pooledClient
+	// active[downstreamSessionID][serverUUID] = stack of in-use clients
+	active map[string]map[string][]*pooledClient
+	// activePerServer[serverUUID] = total in-use connections to this server
+	// across ALL sessions (the real per-server cap)
+	activePerServer map[string]int
 	// lastUsed[serverUUID] = last time any idle client for this server was used
 	lastUsed map[string]time.Time
 }
@@ -44,17 +50,20 @@ func NewPool(maxTotal, maxPerServer int, idleTTL time.Duration) *Pool {
 		idleTTL = 5 * time.Minute
 	}
 	return &Pool{
-		maxTotal:     maxTotal,
-		maxPerServer: maxPerServer,
-		idleTTL:      idleTTL,
-		idle:         make(map[string][]*pooledClient),
-		active:       make(map[string]map[string]*pooledClient),
-		lastUsed:     make(map[string]time.Time),
+		maxTotal:        maxTotal,
+		maxPerServer:    maxPerServer,
+		idleTTL:         idleTTL,
+		idle:            make(map[string][]*pooledClient),
+		active:          make(map[string]map[string][]*pooledClient),
+		activePerServer: make(map[string]int),
+		lastUsed:        make(map[string]time.Time),
 	}
 }
 
 // Acquire returns a connected client for the given server, reusing an idle
-// one if available, otherwise creating a new connection.
+// one if available, otherwise creating a new connection. The per-server cap
+// is reserved atomically BEFORE the factory runs (no check-then-act race),
+// and rolled back if the factory fails.
 func (p *Pool) Acquire(ctx context.Context, sessionID, serverUUID string, factory func() (*UpstreamClient, error)) (*UpstreamClient, error) {
 	p.mu.Lock()
 
@@ -64,30 +73,41 @@ func (p *Pool) Acquire(ctx context.Context, sessionID, serverUUID string, factor
 		p.idle[serverUUID] = stack[:len(stack)-1]
 		p.lastUsed[serverUUID] = time.Now()
 		p.attachLocked(sessionID, serverUUID, pc)
+		p.activePerServer[serverUUID]++
 		p.mu.Unlock()
 		return pc.client, nil
 	}
 
-	// Check caps.
+	// Check caps (global per-server count, not per-session).
 	totalActive := 0
-	for _, m := range p.active {
-		totalActive += len(m)
+	for _, n := range p.activePerServer {
+		totalActive += n
 	}
-	perServer := len(p.active[sessionID])
 	if totalActive >= p.maxTotal {
 		p.mu.Unlock()
 		return nil, errPoolFull
 	}
-	if perServer >= p.maxPerServer {
+	if p.activePerServer[serverUUID] >= p.maxPerServer {
 		p.mu.Unlock()
 		return nil, errPerServerFull
 	}
 
+	// Reserve the slot atomically while still holding the lock. The
+	// factory runs outside the lock, but the reservation is held so N
+	// concurrent acquires cannot all pass the cap check.
+	p.activePerServer[serverUUID]++
 	p.mu.Unlock()
 
 	// Create new connection outside the lock.
 	client, err := factory()
 	if err != nil {
+		// Roll back the reservation.
+		p.mu.Lock()
+		p.activePerServer[serverUUID]--
+		if p.activePerServer[serverUUID] <= 0 {
+			delete(p.activePerServer, serverUUID)
+		}
+		p.mu.Unlock()
 		return nil, err
 	}
 
@@ -99,28 +119,50 @@ func (p *Pool) Acquire(ctx context.Context, sessionID, serverUUID string, factor
 
 func (p *Pool) attachLocked(sessionID, serverUUID string, pc *pooledClient) {
 	if p.active[sessionID] == nil {
-		p.active[sessionID] = make(map[string]*pooledClient)
+		p.active[sessionID] = make(map[string][]*pooledClient)
 	}
-	p.active[sessionID][serverUUID] = pc
+	p.active[sessionID][serverUUID] = append(p.active[sessionID][serverUUID], pc)
 }
 
-// Release returns a client to the idle pool (or closes it if the pool is full).
-func (p *Pool) Release(sessionID, serverUUID string) {
+// Release returns a specific client to the idle pool (or closes it if the
+// pool is full). The client is identified by pointer, NOT by LIFO pop: with
+// concurrent acquires on the same (session, server), popping the top of the
+// stack could hand an in-use connection to another caller (response
+// cross-talk). Pointer identity is unambiguous because a client is always
+// in exactly one place: idle stack or one session's active stack.
+func (p *Pool) Release(sessionID, serverUUID string, client *UpstreamClient) {
 	p.mu.Lock()
 	m := p.active[sessionID]
 	if m == nil {
 		p.mu.Unlock()
 		return
 	}
-	pc, ok := m[serverUUID]
-	if !ok {
+	stack := m[serverUUID]
+	idx := -1
+	for i, pc := range stack {
+		if pc.client == client {
+			idx = i
+			break
+		}
+	}
+	if idx < 0 {
+		// Not found: already released or never attached. Nothing to do.
 		p.mu.Unlock()
 		return
 	}
-	delete(m, serverUUID)
+	pc := stack[idx]
+	// Remove by swap-with-last (order within the stack is irrelevant).
+	stack[idx] = stack[len(stack)-1]
+	stack = stack[:len(stack)-1]
+	if len(stack) == 0 {
+		delete(m, serverUUID)
+	} else {
+		m[serverUUID] = stack
+	}
 	if len(m) == 0 {
 		delete(p.active, sessionID)
 	}
+	p.activePerServer[serverUUID]--
 
 	// Return to idle if under cap.
 	if len(p.idle[serverUUID]) < p.maxPerServer {
@@ -148,13 +190,17 @@ func (p *Pool) ReleaseSession(sessionID string) {
 	}
 	delete(p.active, sessionID)
 	var toClose []*UpstreamClient
-	for _, pc := range m {
-		if len(p.idle[pc.client.serverName]) < p.maxPerServer {
-			pc.usedAt = time.Now()
-			p.idle[pc.client.serverName] = append(p.idle[pc.client.serverName], pc)
-		} else {
-			toClose = append(toClose, pc.client)
+	for serverUUID, stack := range m {
+		for _, pc := range stack {
+			if len(p.idle[serverUUID]) < p.maxPerServer {
+				pc.usedAt = time.Now()
+				p.idle[serverUUID] = append(p.idle[serverUUID], pc)
+				p.lastUsed[serverUUID] = time.Now()
+			} else {
+				toClose = append(toClose, pc.client)
+			}
 		}
+		p.activePerServer[serverUUID] -= len(stack)
 	}
 	p.mu.Unlock()
 
@@ -201,8 +247,8 @@ func (p *Pool) Stats() (idle, active int) {
 	for _, s := range p.idle {
 		idle += len(s)
 	}
-	for _, m := range p.active {
-		active += len(m)
+	for _, n := range p.activePerServer {
+		active += n
 	}
 	return
 }

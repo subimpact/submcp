@@ -18,9 +18,11 @@ import (
 //go:embed static
 var staticFS embed.FS
 
-// UI is the embedded admin interface.
+// UI is the embedded web surface.
 // Serves:
-//   - GET  /            -> admin SPA (login + dashboard)
+//   - GET  /            -> public landing page (features, live stats, support)
+//   - GET  /admin/      -> admin SPA (login + dashboard)
+//   - GET  /api/public/stats -> unauthenticated non-sensitive stats (landing page)
 //   - POST /api/admin/login    -> {key} -> sets session cookie
 //   - POST /api/admin/logout   -> clears session
 //   - GET  /api/admin/overview -> servers, namespaces, endpoints, keys, tools
@@ -29,22 +31,27 @@ var staticFS embed.FS
 type UI struct {
 	db       *db.Pool
 	sessions *sessionStore
+	start    time.Time
 }
 
-// New creates the admin UI handler.
+// New creates the web UI handler.
 func New(dbPool *db.Pool) *UI {
-	return &UI{db: dbPool, sessions: newSessionStore()}
+	return &UI{db: dbPool, sessions: newSessionStore(), start: time.Now()}
 }
 
 // Handler returns the UI's http.Handler (mounted at /).
 func (u *UI) Handler() http.Handler {
 	mux := http.NewServeMux()
 
-	// Static assets (no auth — they contain no data).
+	// Public landing page.
+	mux.HandleFunc("/", u.handleLanding)
+	mux.HandleFunc("/api/public/stats", u.handlePublicStats)
+
+	// Admin static assets (no auth — they contain no data).
 	sub, _ := fs.Sub(staticFS, "static")
 	mux.Handle("/assets/", http.StripPrefix("/assets/", http.FileServer(http.FS(sub))))
 
-	// API (auth required except login).
+	// Admin API (auth required except login).
 	mux.HandleFunc("/api/admin/login", u.handleLogin)
 	mux.HandleFunc("/api/admin/logout", u.handleLogout)
 	mux.HandleFunc("/api/admin/overview", u.requireAuth(u.handleOverview))
@@ -57,9 +64,9 @@ func (u *UI) Handler() http.Handler {
 	mux.HandleFunc("/api/admin/keys", u.requireAuth(u.handleKeys))
 	mux.HandleFunc("/api/admin/keys/", u.requireAuth(u.handleKeyItem))
 
-	// SPA fallback.
-	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path != "/" {
+	// Admin SPA.
+	mux.HandleFunc("/admin/", func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/admin/" && r.URL.Path != "/admin" {
 			http.NotFound(w, r)
 			return
 		}
@@ -69,6 +76,54 @@ func (u *UI) Handler() http.Handler {
 	})
 
 	return mux
+}
+
+// handleLanding serves the public landing page.
+func (u *UI) handleLanding(w http.ResponseWriter, r *http.Request) {
+	if r.URL.Path != "/" {
+		http.NotFound(w, r)
+		return
+	}
+	b, _ := staticFS.ReadFile("static/landing.html")
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	w.Write(b)
+}
+
+// handlePublicStats returns non-sensitive gateway stats for the landing page.
+// No auth: exposes only names, types, error status, and counts.
+func (u *UI) handlePublicStats(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	servers, err := u.db.ListServers(ctx)
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
+		return
+	}
+	toolCount, err := u.db.CountTools(ctx)
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
+		return
+	}
+	nsCount, err := u.db.CountNamespaces(ctx)
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
+		return
+	}
+	upstreams := make([]map[string]any, 0, len(servers))
+	for _, s := range servers {
+		upstreams = append(upstreams, map[string]any{
+			"name":         s.Name,
+			"type":         s.Type,
+			"error_status": s.ErrorStatus,
+		})
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"version":    "0.1.0",
+		"uptime":     time.Since(u.start).Round(time.Second).String(),
+		"servers":    len(servers),
+		"namespaces": nsCount,
+		"tools":      toolCount,
+		"upstreams":  upstreams,
+	})
 }
 
 // --- sessions ---
@@ -149,12 +204,20 @@ func (u *UI) handleLogin(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusUnauthorized, map[string]any{"error": "invalid_key"})
 		return
 	}
+	if !key.IsAdmin {
+		// Gateway keys are NOT admin credentials. Reject non-admin keys
+		// at the admin login (security fix: any API key no longer grants
+		// full admin access).
+		writeJSON(w, http.StatusForbidden, map[string]any{"error": "not_admin"})
+		return
+	}
 	token := u.sessions.create(key.Name)
 	http.SetCookie(w, &http.Cookie{
 		Name:     sessionCookie,
 		Value:    token,
 		Path:     "/",
 		HttpOnly: true,
+		Secure:   true,
 		SameSite: http.SameSiteLaxMode,
 		MaxAge:   86400,
 	})
@@ -169,6 +232,20 @@ func (u *UI) handleLogout(w http.ResponseWriter, r *http.Request) {
 		Name: sessionCookie, Value: "", Path: "/", HttpOnly: true, MaxAge: -1,
 	})
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
+}
+
+// maskServer strips the bearer token from a server before it leaves the
+// admin API (security fix: no credential exfiltration via overview).
+func maskServer(s db.MCPServer) db.MCPServer {
+	s.BearerToken = nil
+	return s
+}
+
+// maskKey strips the key value from an API key before it leaves the admin
+// API. The full key is only returned once, at creation time.
+func maskKey(k db.APIKey) db.APIKey {
+	k.Key = ""
+	return k
 }
 
 // --- overview ---
@@ -210,11 +287,20 @@ func (u *UI) handleOverview(w http.ResponseWriter, r *http.Request) {
 		}
 		mappings[ns.UUID] = ms
 	}
+	// Mask credentials before returning.
+	maskedServers := make([]db.MCPServer, 0, len(servers))
+	for _, s := range servers {
+		maskedServers = append(maskedServers, maskServer(s))
+	}
+	maskedKeys := make([]db.APIKey, 0, len(keys))
+	for _, k := range keys {
+		maskedKeys = append(maskedKeys, maskKey(k))
+	}
 	writeJSON(w, http.StatusOK, map[string]any{
-		"servers":    servers,
+		"servers":    maskedServers,
 		"namespaces": namespaces,
 		"endpoints":  endpoints,
-		"keys":       keys,
+		"keys":       maskedKeys,
 		"mappings":   mappings,
 		"tool_count": toolCount,
 	})
@@ -230,7 +316,11 @@ func (u *UI) handleServers(w http.ResponseWriter, r *http.Request) {
 			writeJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
 			return
 		}
-		writeJSON(w, http.StatusOK, map[string]any{"servers": servers})
+		masked := make([]db.MCPServer, 0, len(servers))
+		for _, s := range servers {
+			masked = append(masked, maskServer(s))
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"servers": masked})
 	case http.MethodPost:
 		var s db.MCPServer
 		if err := json.NewDecoder(r.Body).Decode(&s); err != nil {
@@ -243,6 +333,9 @@ func (u *UI) handleServers(w http.ResponseWriter, r *http.Request) {
 		}
 		if s.Type == "" {
 			s.Type = db.ServerTypeStreamableHTTP
+		}
+		if s.Args == nil {
+			s.Args = []string{}
 		}
 		if s.Env == nil {
 			s.Env = json.RawMessage(`{}`)
@@ -279,6 +372,23 @@ func (u *UI) handleServerItem(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		s.UUID = id
+		// Merge with the existing row so NOT NULL columns (args, env,
+		// headers) never get NULLed when the SPA omits them (fix for
+		// the broken Edit-server path).
+		existing, err := u.db.GetServer(r.Context(), id)
+		if err != nil || existing == nil {
+			writeJSON(w, http.StatusNotFound, map[string]any{"error": "server_not_found"})
+			return
+		}
+		if s.Args == nil {
+			s.Args = existing.Args
+		}
+		if s.Env == nil {
+			s.Env = existing.Env
+		}
+		if s.Headers == nil {
+			s.Headers = existing.Headers
+		}
 		if err := u.db.UpdateServer(r.Context(), &s); err != nil {
 			writeJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
 			return
@@ -481,8 +591,9 @@ func (u *UI) handleKeys(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, map[string]any{"keys": keys})
 	case http.MethodPost:
 		var body struct {
-			Name string `json:"name"`
-			Key  string `json:"key"`
+			Name  string `json:"name"`
+			Key   string `json:"key"`
+			Admin bool   `json:"admin"`
 		}
 		if err := json.NewDecoder(r.Body).Decode(&body); err != nil || strings.TrimSpace(body.Name) == "" {
 			writeJSON(w, http.StatusBadRequest, map[string]any{"error": "name_required"})
@@ -495,7 +606,7 @@ func (u *UI) handleKeys(w http.ResponseWriter, r *http.Request) {
 			_, _ = rand.Read(b)
 			key = "sk_mt_" + hex.EncodeToString(b)
 		}
-		k, err := u.db.CreateAPIKey(r.Context(), body.Name, key)
+		k, err := u.db.CreateAPIKey(r.Context(), body.Name, key, body.Admin)
 		if err != nil {
 			writeJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
 			return

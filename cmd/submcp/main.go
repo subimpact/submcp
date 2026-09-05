@@ -30,6 +30,12 @@ func main() {
 	defer dbPool.Close()
 	log.Printf("connected to postgres %s:%s/%s", cfg.PostgresHost, cfg.PostgresPort, cfg.PostgresDB)
 
+	// Apply pending schema migrations (idempotent, embedded).
+	if err := dbPool.Migrate(ctx); err != nil {
+		log.Fatalf("migrate: %v", err)
+	}
+	log.Printf("migrations applied")
+
 	// Wire the gateway.
 	pool := mcp.NewPool(cfg.MaxTotalConns, cfg.MaxConnsPerServer, 5*time.Minute)
 	agg := mcp.NewAggregator(pool, dbPool)

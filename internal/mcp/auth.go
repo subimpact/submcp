@@ -43,6 +43,17 @@ func (a *Auth) Authenticate(w http.ResponseWriter, r *http.Request, ep *db.Endpo
 			"The provided API key is invalid or expired", nil)
 		return false
 	}
+
+	// Tenant scoping (P0-6): a key may only access endpoints owned by the
+	// same user. NULL == NULL is allowed for single-tenant deployments
+	// where user_id is unset on both sides; once multi-tenant lands,
+	// NULL becomes a hard reject.
+	if apiKey.UserID != nil && ep.UserID != nil && *apiKey.UserID != *ep.UserID {
+		writeAuthError(w, http.StatusForbidden, "forbidden",
+			"API key does not have access to this endpoint", nil)
+		return false
+	}
+
 	return true
 }
 

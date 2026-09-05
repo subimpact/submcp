@@ -41,7 +41,7 @@ func Get() *Config {
 		MCPMaxAttempts:    getEnvInt("MCP_MAX_ATTEMPTS", 1),
 		SessionLifetime:   getEnvDur("SESSION_LIFETIME", 0),
 		MaxTotalConns:     getEnvInt("MAX_TOTAL_CONNECTIONS", 100),
-		MaxConnsPerServer: getEnvInt("MAX_CONNECTIONS_PER_SERVER", 5),
+		MaxConnsPerServer: getEnvInt("MAX_CONNECTIONS_PER_SERVER", 20),
 		LogLevel:          getEnv("LOG_LEVEL", "info"),
 	}
 }

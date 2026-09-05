@@ -116,6 +116,7 @@ type APIKey struct {
 	UserID    *string   `json:"user_id"`
 	CreatedAt time.Time `json:"created_at"`
 	IsActive  bool      `json:"is_active"`
+	IsAdmin   bool      `json:"is_admin"`
 }
 
 // GetEndpointByName looks up an endpoint by its public name.
@@ -230,10 +231,10 @@ func (p *Pool) GetToolMappings(ctx context.Context, namespaceUUID string) ([]str
 // validation (eq on key, is_active).
 func (p *Pool) ValidateAPIKey(ctx context.Context, key string) (*APIKey, error) {
 	row := p.QueryRow(ctx, `
-		SELECT uuid, name, key, user_id, created_at, is_active
+		SELECT uuid, name, key, user_id, created_at, is_active, is_admin
 		FROM api_keys WHERE key = $1 AND is_active = true`, key)
 	var k APIKey
-	err := row.Scan(&k.UUID, &k.Name, &k.Key, &k.UserID, &k.CreatedAt, &k.IsActive)
+	err := row.Scan(&k.UUID, &k.Name, &k.Key, &k.UserID, &k.CreatedAt, &k.IsActive, &k.IsAdmin)
 	if err == pgx.ErrNoRows {
 		return nil, nil
 	}
@@ -272,6 +273,13 @@ func (p *Pool) ListEndpoints(ctx context.Context) ([]Endpoint, error) {
 func (p *Pool) CountTools(ctx context.Context) (int, error) {
 	var n int
 	err := p.QueryRow(ctx, `SELECT count(*) FROM tools`).Scan(&n)
+	return n, err
+}
+
+// CountNamespaces returns the number of namespaces.
+func (p *Pool) CountNamespaces(ctx context.Context) (int, error) {
+	var n int
+	err := p.QueryRow(ctx, `SELECT count(*) FROM namespaces`).Scan(&n)
 	return n, err
 }
 
@@ -421,7 +429,7 @@ func (p *Pool) SetServerMapping(ctx context.Context, namespaceUUID, serverUUID s
 // ListAPIKeys returns all API keys (admin view, key values included).
 func (p *Pool) ListAPIKeys(ctx context.Context) ([]APIKey, error) {
 	rows, err := p.Query(ctx, `
-		SELECT uuid, name, key, user_id, created_at, is_active
+		SELECT uuid, name, key, user_id, created_at, is_active, is_admin
 		FROM api_keys ORDER BY created_at DESC`)
 	if err != nil {
 		return nil, err
@@ -432,7 +440,7 @@ func (p *Pool) ListAPIKeys(ctx context.Context) ([]APIKey, error) {
 	for rows.Next() {
 		var k APIKey
 		if err := rows.Scan(&k.UUID, &k.Name, &k.Key, &k.UserID, &k.CreatedAt,
-			&k.IsActive); err != nil {
+			&k.IsActive, &k.IsAdmin); err != nil {
 			return nil, err
 		}
 		out = append(out, k)
@@ -441,12 +449,12 @@ func (p *Pool) ListAPIKeys(ctx context.Context) ([]APIKey, error) {
 }
 
 // CreateAPIKey inserts a new API key.
-func (p *Pool) CreateAPIKey(ctx context.Context, name, key string) (*APIKey, error) {
+func (p *Pool) CreateAPIKey(ctx context.Context, name, key string, isAdmin bool) (*APIKey, error) {
 	var k APIKey
 	err := p.QueryRow(ctx, `
-		INSERT INTO api_keys (name, key)
-		VALUES ($1, $2) RETURNING uuid, created_at, is_active`,
-		name, key).Scan(&k.UUID, &k.CreatedAt, &k.IsActive)
+		INSERT INTO api_keys (name, key, is_admin)
+		VALUES ($1, $2, $3) RETURNING uuid, created_at, is_active, is_admin`,
+		name, key, isAdmin).Scan(&k.UUID, &k.CreatedAt, &k.IsActive, &k.IsAdmin)
 	if err != nil {
 		return nil, err
 	}

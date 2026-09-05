@@ -186,6 +186,9 @@ func (a *Aggregator) CallTool(ctx context.Context, namespaceUUID, sessionID, too
 	if target == nil {
 		return nil, fmt.Errorf("no active server matching %q in namespace", serverName)
 	}
+	if target.URL == nil || *target.URL == "" {
+		return nil, fmt.Errorf("server %q has no URL configured", target.Name)
+	}
 
 	client, err := a.pool.Acquire(ctx, sessionID, target.UUID, func() (*UpstreamClient, error) {
 		cfg := UpstreamConfig{
@@ -204,12 +207,15 @@ func (a *Aggregator) CallTool(ctx context.Context, namespaceUUID, sessionID, too
 	if err != nil {
 		return nil, fmt.Errorf("acquire upstream %s: %w", target.Name, err)
 	}
-	defer a.pool.Release(sessionID, target.UUID)
+	defer a.pool.Release(sessionID, target.UUID, client)
 
 	return client.CallTool(ctx, originalName, args)
 }
 
 func (a *Aggregator) listFromServer(ctx context.Context, s db.MCPServer) ([]Tool, error) {
+	if s.URL == nil || *s.URL == "" {
+		return nil, fmt.Errorf("server %q has no URL configured", s.Name)
+	}
 	// Use a per-call session id (pool handles reuse).
 	sessionID := "list-" + s.UUID
 	client, err := a.pool.Acquire(ctx, sessionID, s.UUID, func() (*UpstreamClient, error) {
@@ -229,7 +235,7 @@ func (a *Aggregator) listFromServer(ctx context.Context, s db.MCPServer) ([]Tool
 	if err != nil {
 		return nil, err
 	}
-	defer a.pool.Release(sessionID, s.UUID)
+	defer a.pool.Release(sessionID, s.UUID, client)
 
 	tools, err := client.ListTools(ctx)
 	if err != nil {

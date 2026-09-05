@@ -358,8 +358,8 @@ function renderKeys() {
   el.innerHTML = state.keys.map((k) => `
     <div class="card"><div class="row">
       <div>
-        <div class="name">${esc(k.name)} <span class="badge ${k.is_active ? "active" : "inactive"}">${k.is_active ? "ACTIVE" : "INACTIVE"}</span></div>
-        <div class="sub"><code>${esc(k.key)}</code> · created ${new Date(k.created_at).toLocaleString()}</div>
+        <div class="name">${esc(k.name)} <span class="badge ${k.is_active ? "active" : "inactive"}">${k.is_active ? "ACTIVE" : "INACTIVE"}</span>${k.is_admin ? ' <span class="badge">admin</span>' : ""}</div>
+        <div class="sub">${k.key ? `<code>${esc(k.key)}</code> · ` : ""}created ${new Date(k.created_at).toLocaleString()}</div>
       </div>
       <div class="actions">
         <button class="small" data-toggle-key="${k.uuid}" data-active="${k.is_active}">${k.is_active ? "Disable" : "Enable"}</button>
@@ -377,7 +377,7 @@ $("#key-form-fields").addEventListener("submit", async (e) => {
   try {
     const r = await api("/api/admin/keys", {
       method: "POST",
-      body: JSON.stringify({ name: f.name.value.trim(), key: f.key.value.trim() || null }),
+      body: JSON.stringify({ name: f.name.value.trim(), key: f.key.value.trim() || null, admin: f.admin.checked }),
     });
     $("#key-form").classList.add("hidden");
     f.reset();
