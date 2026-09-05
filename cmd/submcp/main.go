@@ -65,6 +65,8 @@ func main() {
 	root := http.NewServeMux()
 	root.Handle("/", adminUI.Handler())
 	root.Handle("/health", srv.Handler())
+	root.Handle("/ready", srv.Handler())
+	root.Handle("/metrics", srv.Handler())
 	root.Handle("/metamcp/", srv.Handler())
 
 	// Request logging middleware (P1-14): method, path, status, duration,
