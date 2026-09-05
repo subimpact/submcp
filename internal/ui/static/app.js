@@ -73,15 +73,21 @@ $$(".tab").forEach((btn) => {
 // --- overview ---
 
 async function loadOverview() {
-  const data = await api("/api/admin/overview");
-  state = data;
-  renderStats();
-  renderOverviewServers();
-  renderOverviewEndpoints();
-  renderServers();
-  renderNamespaces();
-  renderEndpoints();
-  renderKeys();
+  try {
+    const data = await api("/api/admin/overview");
+    state = data;
+    renderStats();
+    renderOverviewServers();
+    renderOverviewEndpoints();
+    renderServers();
+    renderNamespaces();
+    renderEndpoints();
+    renderKeys();
+  } catch (err) {
+    // P2-12: a failed refresh must not leave the UI half-rendered or
+    // throw an unhandled rejection; surface it and keep the last state.
+    console.error("overview load failed:", err);
+  }
 }
 
 function renderStats() {
@@ -212,8 +218,12 @@ $("#server-form-fields").addEventListener("submit", async (e) => {
 async function delServer(uuid) {
   const s = state.servers.find((x) => x.uuid === uuid);
   if (!confirm(`Delete server "${s?.name}"? This removes its tools and mappings.`)) return;
-  await api(`/api/admin/servers/${uuid}`, { method: "DELETE" });
-  await loadOverview();
+  try {
+    await api(`/api/admin/servers/${uuid}`, { method: "DELETE" });
+    await loadOverview();
+  } catch (err) {
+    alert(`Delete failed: ${err.message}`);
+  }
 }
 
 // --- namespaces ---
@@ -244,11 +254,15 @@ function renderNamespaces() {
 }
 
 async function toggleMapping(ns, server, wasActive) {
-  await api(`/api/admin/namespaces/${ns}`, {
-    method: "POST",
-    body: JSON.stringify({ server_uuid: server, status: wasActive ? "INACTIVE" : "ACTIVE" }),
-  });
-  await loadOverview();
+  try {
+    await api(`/api/admin/namespaces/${ns}`, {
+      method: "POST",
+      body: JSON.stringify({ server_uuid: server, status: wasActive ? "INACTIVE" : "ACTIVE" }),
+    });
+    await loadOverview();
+  } catch (err) {
+    alert(`Mapping update failed: ${err.message}`);
+  }
 }
 
 $("#namespace-new").addEventListener("click", () => $("#namespace-form").classList.remove("hidden"));
@@ -274,8 +288,12 @@ $("#namespace-form-fields").addEventListener("submit", async (e) => {
 async function delNamespace(uuid) {
   const n = state.namespaces.find((x) => x.uuid === uuid);
   if (!confirm(`Delete namespace "${n?.name}"? Its endpoints and mappings are removed.`)) return;
-  await api(`/api/admin/namespaces/${uuid}`, { method: "DELETE" });
-  await loadOverview();
+  try {
+    await api(`/api/admin/namespaces/${uuid}`, { method: "DELETE" });
+    await loadOverview();
+  } catch (err) {
+    alert(`Delete failed: ${err.message}`);
+  }
 }
 
 // --- endpoints ---
@@ -346,8 +364,12 @@ $("#endpoint-form-fields").addEventListener("submit", async (e) => {
 async function delEndpoint(uuid) {
   const e = state.endpoints.find((x) => x.uuid === uuid);
   if (!confirm(`Delete endpoint "/metamcp/${e?.name}/mcp"?`)) return;
-  await api(`/api/admin/endpoints/${uuid}`, { method: "DELETE" });
-  await loadOverview();
+  try {
+    await api(`/api/admin/endpoints/${uuid}`, { method: "DELETE" });
+    await loadOverview();
+  } catch (err) {
+    alert(`Delete failed: ${err.message}`);
+  }
 }
 
 // --- keys ---
@@ -390,8 +412,12 @@ $("#key-form-fields").addEventListener("submit", async (e) => {
 });
 
 async function toggleKey(uuid, wasActive) {
-  await api(`/api/admin/keys/${uuid}`, { method: "POST", body: JSON.stringify({ active: !wasActive }) });
-  await loadOverview();
+  try {
+    await api(`/api/admin/keys/${uuid}`, { method: "POST", body: JSON.stringify({ active: !wasActive }) });
+    await loadOverview();
+  } catch (err) {
+    alert(`Key update failed: ${err.message}`);
+  }
 }
 
 // --- boot ---

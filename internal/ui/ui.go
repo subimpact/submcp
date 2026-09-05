@@ -1,11 +1,14 @@
 package ui
 
 import (
+	"context"
 	"crypto/rand"
 	"embed"
 	"encoding/hex"
 	"encoding/json"
 	"io/fs"
+	"log/slog"
+	"net"
 	"net/http"
 	"strings"
 	"sync"
@@ -18,6 +21,31 @@ import (
 //go:embed static
 var staticFS embed.FS
 
+// Store is the DB surface the admin UI needs (P2-10: extracted so the UI
+// is testable against a fake and not coupled to the concrete *db.Pool).
+type Store interface {
+	CountNamespaces(ctx context.Context) (int, error)
+	CountTools(ctx context.Context) (int, error)
+	CreateAPIKey(ctx context.Context, name, key string, isAdmin bool) (*db.APIKey, error)
+	CreateEndpoint(ctx context.Context, e *db.Endpoint) error
+	CreateNamespace(ctx context.Context, n *db.Namespace) error
+	CreateServer(ctx context.Context, s *db.MCPServer) error
+	DeleteEndpoint(ctx context.Context, uuid string) error
+	DeleteNamespace(ctx context.Context, uuid string) error
+	DeleteServer(ctx context.Context, uuid string) error
+	GetServer(ctx context.Context, uuid string) (*db.MCPServer, error)
+	ListAPIKeys(ctx context.Context) ([]db.APIKey, error)
+	ListEndpoints(ctx context.Context) ([]db.Endpoint, error)
+	ListNamespaceServerMappings(ctx context.Context, namespaceUUID string) ([]db.NamespaceServerMapping, error)
+	ListNamespaces(ctx context.Context) ([]db.Namespace, error)
+	ListServers(ctx context.Context) ([]db.MCPServer, error)
+	SetAPIKeyActive(ctx context.Context, uuid string, active bool) error
+	SetServerMapping(ctx context.Context, namespaceUUID, serverUUID string, status db.ServerStatus) error
+	UpdateEndpoint(ctx context.Context, e *db.Endpoint) error
+	UpdateServer(ctx context.Context, s *db.MCPServer) error
+	ValidateAPIKey(ctx context.Context, key string) (*db.APIKey, error)
+}
+
 // UI is the embedded web surface.
 // Serves:
 //   - GET  /            -> public landing page (features, live stats, support)
@@ -29,9 +57,12 @@ var staticFS embed.FS
 //   - CRUD /api/admin/servers|namespaces|endpoints|keys
 //   - POST /api/admin/servers/:uuid/test -> live connectivity check
 type UI struct {
-	db       *db.Pool
+	db       Store
 	sessions *sessionStore
 	start    time.Time
+
+	// P2-3: admin IP allowlist (empty = allow all).
+	adminAllowlist []*net.IPNet
 
 	// Public stats cache (A8): 60s TTL, avoids DB hits per landing page load.
 	statsMu    sync.Mutex
@@ -40,8 +71,64 @@ type UI struct {
 }
 
 // New creates the web UI handler.
-func New(dbPool *db.Pool) *UI {
+func New(dbPool Store) *UI {
 	return &UI{db: dbPool, sessions: newSessionStore(), start: time.Now()}
+}
+
+// NewWithAllowlist creates the web UI handler with an admin IP allowlist
+// (P2-3). allowlist is a comma-separated list of CIDRs or single IPs;
+// empty disables the restriction.
+func NewWithAllowlist(dbPool Store, allowlist string) *UI {
+	u := New(dbPool)
+	u.adminAllowlist = parseAllowlist(allowlist)
+	return u
+}
+
+// parseAllowlist parses "cidr,ip,..." into a list of *net.IPNet.
+func parseAllowlist(s string) []*net.IPNet {
+	var out []*net.IPNet
+	for _, part := range strings.Split(s, ",") {
+		part = strings.TrimSpace(part)
+		if part == "" {
+			continue
+		}
+		if !strings.Contains(part, "/") {
+			// Bare IP -> /32 or /128.
+			ip := net.ParseIP(part)
+			if ip == nil {
+				continue
+			}
+			bits := 32
+			if ip.To4() == nil {
+				bits = 128
+			}
+			out = append(out, &net.IPNet{IP: ip, Mask: net.CIDRMask(bits, bits)})
+			continue
+		}
+		_, cidr, err := net.ParseCIDR(part)
+		if err == nil {
+			out = append(out, cidr)
+		}
+	}
+	return out
+}
+
+// allowlistAllows reports whether the client IP is permitted by the
+// admin allowlist (empty allowlist = allow all).
+func (u *UI) allowlistAllows(ipStr string) bool {
+	if len(u.adminAllowlist) == 0 {
+		return true
+	}
+	ip := net.ParseIP(ipStr)
+	if ip == nil {
+		return false
+	}
+	for _, cidr := range u.adminAllowlist {
+		if cidr.Contains(ip) {
+			return true
+		}
+	}
+	return false
 }
 
 // SweepSessions removes expired admin sessions (P1-4).
@@ -218,6 +305,11 @@ const sessionCookie = "submcp_session"
 
 func (u *UI) requireAuth(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
+		// P2-3: admin allowlist — check source IP before anything else.
+		if !u.allowlistAllows(clientIP(r)) {
+			writeJSON(w, http.StatusForbidden, map[string]any{"error": "forbidden"})
+			return
+		}
 		c, err := r.Cookie(sessionCookie)
 		if err != nil || !u.sessions.valid(c.Value) {
 			writeJSON(w, http.StatusUnauthorized, map[string]any{"error": "unauthorized"})
@@ -225,6 +317,17 @@ func (u *UI) requireAuth(next http.HandlerFunc) http.HandlerFunc {
 		}
 		next(w, r)
 	}
+}
+
+// clientIP extracts the client IP, honoring X-Forwarded-For (Traefik).
+func clientIP(r *http.Request) string {
+	if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
+		if i := strings.IndexByte(xff, ','); i >= 0 {
+			return strings.TrimSpace(xff[:i])
+		}
+		return strings.TrimSpace(xff)
+	}
+	return r.RemoteAddr
 }
 
 func (u *UI) handleLogin(w http.ResponseWriter, r *http.Request) {
@@ -294,27 +397,27 @@ func (u *UI) handleOverview(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	servers, err := u.db.ListServers(ctx)
 	if err != nil {
-		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
+		writeInternalError(w, "list_servers", err)
 		return
 	}
 	namespaces, err := u.db.ListNamespaces(ctx)
 	if err != nil {
-		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
+		writeInternalError(w, "list_namespaces", err)
 		return
 	}
 	endpoints, err := u.db.ListEndpoints(ctx)
 	if err != nil {
-		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
+		writeInternalError(w, "list_endpoints", err)
 		return
 	}
 	keys, err := u.db.ListAPIKeys(ctx)
 	if err != nil {
-		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
+		writeInternalError(w, "list_keys", err)
 		return
 	}
 	toolCount, err := u.db.CountTools(ctx)
 	if err != nil {
-		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
+		writeInternalError(w, "count_tools", err)
 		return
 	}
 	// Namespace -> server mappings (for the matrix view).
@@ -322,7 +425,7 @@ func (u *UI) handleOverview(w http.ResponseWriter, r *http.Request) {
 	for _, ns := range namespaces {
 		ms, err := u.db.ListNamespaceServerMappings(ctx, ns.UUID)
 		if err != nil {
-			writeJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
+			writeInternalError(w, "list_ns_mappings", err)
 			return
 		}
 		mappings[ns.UUID] = ms
@@ -353,7 +456,7 @@ func (u *UI) handleServers(w http.ResponseWriter, r *http.Request) {
 	case http.MethodGet:
 		servers, err := u.db.ListServers(r.Context())
 		if err != nil {
-			writeJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
+			writeInternalError(w, "list_servers", err)
 			return
 		}
 		masked := make([]db.MCPServer, 0, len(servers))
@@ -384,7 +487,7 @@ func (u *UI) handleServers(w http.ResponseWriter, r *http.Request) {
 			s.Headers = json.RawMessage(`{}`)
 		}
 		if err := u.db.CreateServer(r.Context(), &s); err != nil {
-			writeJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
+			writeInternalError(w, "create_server", err)
 			return
 		}
 		writeJSON(w, http.StatusCreated, map[string]any{"server": s})
@@ -430,13 +533,13 @@ func (u *UI) handleServerItem(w http.ResponseWriter, r *http.Request) {
 			s.Headers = existing.Headers
 		}
 		if err := u.db.UpdateServer(r.Context(), &s); err != nil {
-			writeJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
+			writeInternalError(w, "update_server", err)
 			return
 		}
 		writeJSON(w, http.StatusOK, map[string]any{"ok": true})
 	case http.MethodDelete:
 		if err := u.db.DeleteServer(r.Context(), id); err != nil {
-			writeJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
+			writeInternalError(w, "delete_server", err)
 			return
 		}
 		writeJSON(w, http.StatusOK, map[string]any{"ok": true})
@@ -469,6 +572,8 @@ func (u *UI) handleServerTest(w http.ResponseWriter, r *http.Request, id string)
 		Timeout:     10 * time.Second,
 	})
 	ctx := r.Context()
+	// P2-4 exception: this is the "test connection" diagnostic — the
+	// error message is the result the admin needs to fix the upstream.
 	if err := client.Connect(ctx); err != nil {
 		writeJSON(w, http.StatusOK, map[string]any{"ok": false, "error": err.Error()})
 		return
@@ -496,7 +601,7 @@ func (u *UI) handleNamespaces(w http.ResponseWriter, r *http.Request) {
 	case http.MethodGet:
 		ns, err := u.db.ListNamespaces(r.Context())
 		if err != nil {
-			writeJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
+			writeInternalError(w, "list_namespaces", err)
 			return
 		}
 		writeJSON(w, http.StatusOK, map[string]any{"namespaces": ns})
@@ -511,7 +616,7 @@ func (u *UI) handleNamespaces(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		if err := u.db.CreateNamespace(r.Context(), &n); err != nil {
-			writeJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
+			writeInternalError(w, "create_namespace", err)
 			return
 		}
 		writeJSON(w, http.StatusCreated, map[string]any{"namespace": n})
@@ -542,13 +647,13 @@ func (u *UI) handleNamespaceItem(w http.ResponseWriter, r *http.Request) {
 			status = db.ServerStatusInactive
 		}
 		if err := u.db.SetServerMapping(r.Context(), id, body.ServerUUID, status); err != nil {
-			writeJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
+			writeInternalError(w, "set_server_mapping", err)
 			return
 		}
 		writeJSON(w, http.StatusOK, map[string]any{"ok": true})
 	case http.MethodDelete:
 		if err := u.db.DeleteNamespace(r.Context(), id); err != nil {
-			writeJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
+			writeInternalError(w, "delete_namespace", err)
 			return
 		}
 		writeJSON(w, http.StatusOK, map[string]any{"ok": true})
@@ -564,7 +669,7 @@ func (u *UI) handleEndpoints(w http.ResponseWriter, r *http.Request) {
 	case http.MethodGet:
 		eps, err := u.db.ListEndpoints(r.Context())
 		if err != nil {
-			writeJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
+			writeInternalError(w, "list_endpoints", err)
 			return
 		}
 		writeJSON(w, http.StatusOK, map[string]any{"endpoints": eps})
@@ -578,8 +683,14 @@ func (u *UI) handleEndpoints(w http.ResponseWriter, r *http.Request) {
 			writeJSON(w, http.StatusBadRequest, map[string]any{"error": "name_and_namespace_required"})
 			return
 		}
+		// P2-11: endpoint names become URL path segments — reject anything
+		// outside [a-zA-Z0-9_-] (max 64).
+		if !db.ValidEndpointName(e.Name) {
+			writeJSON(w, http.StatusBadRequest, map[string]any{"error": "invalid_endpoint_name"})
+			return
+		}
 		if err := u.db.CreateEndpoint(r.Context(), &e); err != nil {
-			writeJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
+			writeInternalError(w, "create_endpoint", err)
 			return
 		}
 		writeJSON(w, http.StatusCreated, map[string]any{"endpoint": e})
@@ -602,14 +713,19 @@ func (u *UI) handleEndpointItem(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		e.UUID = id
+		// P2-11: same name constraint on update.
+		if !db.ValidEndpointName(e.Name) {
+			writeJSON(w, http.StatusBadRequest, map[string]any{"error": "invalid_endpoint_name"})
+			return
+		}
 		if err := u.db.UpdateEndpoint(r.Context(), &e); err != nil {
-			writeJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
+			writeInternalError(w, "update_endpoint", err)
 			return
 		}
 		writeJSON(w, http.StatusOK, map[string]any{"ok": true})
 	case http.MethodDelete:
 		if err := u.db.DeleteEndpoint(r.Context(), id); err != nil {
-			writeJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
+			writeInternalError(w, "delete_endpoint", err)
 			return
 		}
 		writeJSON(w, http.StatusOK, map[string]any{"ok": true})
@@ -625,7 +741,7 @@ func (u *UI) handleKeys(w http.ResponseWriter, r *http.Request) {
 	case http.MethodGet:
 		keys, err := u.db.ListAPIKeys(r.Context())
 		if err != nil {
-			writeJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
+			writeInternalError(w, "list_keys", err)
 			return
 		}
 		writeJSON(w, http.StatusOK, map[string]any{"keys": keys})
@@ -648,7 +764,7 @@ func (u *UI) handleKeys(w http.ResponseWriter, r *http.Request) {
 		}
 		k, err := u.db.CreateAPIKey(r.Context(), body.Name, key, body.Admin)
 		if err != nil {
-			writeJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
+			writeInternalError(w, "create_key", err)
 			return
 		}
 		writeJSON(w, http.StatusCreated, map[string]any{"key": k})
@@ -673,7 +789,7 @@ func (u *UI) handleKeyItem(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		if err := u.db.SetAPIKeyActive(r.Context(), id, *body.Active); err != nil {
-			writeJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
+			writeInternalError(w, "set_key_active", err)
 			return
 		}
 		writeJSON(w, http.StatusOK, map[string]any{"ok": true})
@@ -688,4 +804,11 @@ func writeJSON(w http.ResponseWriter, status int, v any) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
 	_ = json.NewEncoder(w).Encode(v)
+}
+
+// writeInternalError logs the real error and returns a generic message
+// (P2-4: never leak DB/connection details to admin API callers).
+func writeInternalError(w http.ResponseWriter, op string, err error) {
+	slog.Error("admin api error", "op", op, "err", err)
+	writeJSON(w, http.StatusInternalServerError, map[string]any{"error": "internal_error"})
 }

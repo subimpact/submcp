@@ -64,6 +64,9 @@ type Aggregator struct {
 
 	// P1-6: metrics.
 	metrics *Metrics
+
+	// P1-3: SSRF guard (nil = disabled).
+	ssrf *SSRFGuard
 }
 
 const (
@@ -88,6 +91,11 @@ type nsRoute struct {
 
 // NewAggregator creates the fan-out engine.
 func NewAggregator(pool *Pool, dbPool ToolStore) *Aggregator {
+	return NewAggregatorWithSSRF(pool, dbPool, nil)
+}
+
+// NewAggregatorWithSSRF creates the fan-out engine with an SSRF guard.
+func NewAggregatorWithSSRF(pool *Pool, dbPool ToolStore, ssrf *SSRFGuard) *Aggregator {
 	return &Aggregator{
 		pool:       pool,
 		db:         dbPool,
@@ -98,6 +106,7 @@ func NewAggregator(pool *Pool, dbPool ToolStore) *Aggregator {
 		syncHashes: make(map[string]string),
 		breakers:   make(map[string]*Breaker),
 		metrics:    NewMetrics(pool),
+		ssrf:       ssrf,
 	}
 }
 
@@ -308,6 +317,13 @@ func (a *Aggregator) CallTool(ctx context.Context, namespaceUUID, sessionID, too
 		return nil, fmt.Errorf("server %q has no URL configured", target.Name)
 	}
 
+	// P1-3: SSRF guard on the call path too.
+	if a.ssrf != nil {
+		if err := a.ssrf.Check(*target.URL); err != nil {
+			return nil, fmt.Errorf("server %q: %w", target.Name, err)
+		}
+	}
+
 	// P1-6: circuit breaker — fail fast when the upstream is down.
 	b := a.breaker(target.UUID)
 	if !b.Allow() {
@@ -420,6 +436,13 @@ func (a *Aggregator) getServerTools(ctx context.Context, s db.MCPServer, overrid
 func (a *Aggregator) fetchServerTools(ctx context.Context, s db.MCPServer, overrideNames map[string]bool) ([]Tool, error) {
 	if s.URL == nil || *s.URL == "" {
 		return nil, fmt.Errorf("server %q has no URL configured", s.Name)
+	}
+	// P1-3: SSRF guard — block metadata/loopback always, RFC1918 unless
+	// allowPrivate (self-hosted n8n etc.).
+	if a.ssrf != nil {
+		if err := a.ssrf.Check(*s.URL); err != nil {
+			return nil, fmt.Errorf("server %q: %w", s.Name, err)
+		}
 	}
 	b := a.breaker(s.UUID)
 	if !b.Allow() {

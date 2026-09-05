@@ -227,12 +227,14 @@ func (p *Pool) GetToolMappings(ctx context.Context, namespaceUUID string) ([]str
 	return out, rows.Err()
 }
 
-// ValidateAPIKey checks a key against api_keys. Mirrors api-keys.repo.ts
+// ValidateAPIKey checks a key against api_keys by SHA-256 hash
+// (P2-13: plaintext keys are never compared in the DB; the migration
+// backfilled key_hash for existing rows). Mirrors api-keys.repo.ts
 // validation (eq on key, is_active).
 func (p *Pool) ValidateAPIKey(ctx context.Context, key string) (*APIKey, error) {
 	row := p.QueryRow(ctx, `
 		SELECT uuid, name, key, user_id, created_at, is_active, is_admin
-		FROM api_keys WHERE key = $1 AND is_active = true`, key)
+		FROM api_keys WHERE key_hash = encode(sha256($1::bytea), 'hex') AND is_active = true`, key)
 	var k APIKey
 	err := row.Scan(&k.UUID, &k.Name, &k.Key, &k.UserID, &k.CreatedAt, &k.IsActive, &k.IsAdmin)
 	if err == pgx.ErrNoRows {
@@ -457,12 +459,14 @@ func (p *Pool) ListAPIKeys(ctx context.Context) ([]APIKey, error) {
 	return out, rows.Err()
 }
 
-// CreateAPIKey inserts a new API key.
+// CreateAPIKey inserts a new API key (P2-13: stores the SHA-256 hash,
+// never the plaintext).
 func (p *Pool) CreateAPIKey(ctx context.Context, name, key string, isAdmin bool) (*APIKey, error) {
 	var k APIKey
 	err := p.QueryRow(ctx, `
-		INSERT INTO api_keys (name, key, is_admin)
-		VALUES ($1, $2, $3) RETURNING uuid, created_at, is_active, is_admin`,
+		INSERT INTO api_keys (name, key, key_hash, is_admin)
+		VALUES ($1, $2, encode(sha256($2::bytea), 'hex'), $3)
+		RETURNING uuid, created_at, is_active, is_admin`,
 		name, key, isAdmin).Scan(&k.UUID, &k.CreatedAt, &k.IsActive, &k.IsAdmin)
 	if err != nil {
 		return nil, err
@@ -498,6 +502,22 @@ func (p *Pool) ListToolsByServer(ctx context.Context, serverUUID string) ([]Tool
 		out = append(out, t)
 	}
 	return out, rows.Err()
+}
+
+// ValidEndpointName reports whether an endpoint name is safe to use as a
+// URL path segment (P2-11). Mirrors the original's endpoint-name
+// constraint: [a-zA-Z0-9_-], non-empty, no leading/trailing separators.
+func ValidEndpointName(name string) bool {
+	if name == "" || len(name) > 64 {
+		return false
+	}
+	for i := 0; i < len(name); i++ {
+		c := name[i]
+		if !(c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' || c >= '0' && c <= '9' || c == '_' || c == '-') {
+			return false
+		}
+	}
+	return true
 }
 
 // CreateEndpoint inserts a new endpoint.

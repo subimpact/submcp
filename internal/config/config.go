@@ -28,6 +28,14 @@ type Config struct {
 
 	// Logging
 	LogLevel string
+
+	// P1-3: SSRF guard. Allow RFC1918/link-local upstreams (self-hosted
+	// n8n etc.). 169.254/8 + 127.0.0.0/8 are ALWAYS blocked.
+	AllowPrivateUpstreams bool
+
+	// P2-3: admin allowlist mode. Comma-separated CIDRs/IPs; when set,
+	// /api/admin/* is restricted to those source IPs (empty = allow all).
+	AdminIPAllowlist string
 }
 
 func Get() *Config {
@@ -45,7 +53,24 @@ func Get() *Config {
 		MaxTotalConns:     getEnvInt("MAX_TOTAL_CONNECTIONS", 100),
 		MaxConnsPerServer: getEnvInt("MAX_CONNECTIONS_PER_SERVER", 20),
 		LogLevel:          getEnv("LOG_LEVEL", "info"),
+		// P1-3: default ON for self-hosted (n8n internal), OFF for SaaS.
+		AllowPrivateUpstreams: getEnvBool("ALLOW_PRIVATE_UPSTREAMS", true),
+		// P2-3: empty = allow all (default); set ADMIN_IP_ALLOWLIST to
+		// restrict the admin plane (e.g. "10.0.0.0/8,203.0.113.5").
+		AdminIPAllowlist: getEnv("ADMIN_IP_ALLOWLIST", ""),
 	}
+}
+
+func getEnvBool(key string, def bool) bool {
+	v := os.Getenv(key)
+	if v == "" {
+		return def
+	}
+	b, err := strconv.ParseBool(v)
+	if err != nil {
+		return def
+	}
+	return b
 }
 
 func getEnv(key, def string) string {

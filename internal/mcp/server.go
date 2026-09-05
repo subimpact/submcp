@@ -91,7 +91,8 @@ func (s *Server) poolStats() map[string]any {
 	return map[string]any{"idle": idle, "active": active}
 }
 
-// withCORS enables browser MCP clients (P2-5a). Mirrors the original's
+// withCORS enables browser MCP clients (P2-5a) and adds security headers
+// (P2-5b). Mirrors the original's
 // cors({ origin: true, credentials: true, methods: [GET,POST,DELETE,OPTIONS],
 // allowedHeaders: [Content-Type, mcp-session-id, Authorization, X-API-Key] }).
 // Origin is echoed (NOT "*" — "*" with credentials is invalid per spec);
@@ -104,6 +105,12 @@ func withCORS(next http.Handler) http.Handler {
 			w.Header().Set("Vary", "Origin")
 			w.Header().Set("Access-Control-Allow-Credentials", "true")
 		}
+		// P2-5b security headers (defense in depth; TLS is terminated at
+		// Traefik, so HSTS is set there — these cover the app layer).
+		w.Header().Set("X-Content-Type-Options", "nosniff")
+		w.Header().Set("X-Frame-Options", "DENY")
+		w.Header().Set("Referrer-Policy", "no-referrer")
+		w.Header().Set("X-XSS-Protection", "0") // modern browsers ignore; kills legacy XSS-auditor bypasses
 		if r.Method == http.MethodOptions {
 			w.Header().Set("Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS")
 			w.Header().Set("Access-Control-Allow-Headers", "Content-Type, mcp-session-id, Authorization, X-API-Key")

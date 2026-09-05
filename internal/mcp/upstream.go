@@ -48,12 +48,23 @@ func NewUpstreamClient(cfg UpstreamConfig) *UpstreamClient {
 	if cfg.BearerToken != "" {
 		auth = "Bearer " + cfg.BearerToken
 	}
+	// P2-14 transport tuning: the default transport caps idle conns per
+	// host at 2, which throttles a gateway fanning out to many upstreams.
+	// Raise the idle pool, bound handshakes, and reap idle conns.
+	transport := &http.Transport{
+		MaxIdleConns:          64,
+		MaxIdleConnsPerHost:   16,
+		IdleConnTimeout:       90 * time.Second,
+		TLSHandshakeTimeout:   10 * time.Second,
+		ResponseHeaderTimeout: 30 * time.Second,
+		ExpectContinueTimeout: 1 * time.Second,
+	}
 	return &UpstreamClient{
 		serverName: cfg.Name,
 		url:        cfg.URL,
 		authHeader: auth,
 		extraHdrs:  cfg.Headers,
-		httpClient: &http.Client{Timeout: cfg.Timeout},
+		httpClient: &http.Client{Timeout: cfg.Timeout, Transport: transport},
 	}
 }
 
@@ -342,19 +353,11 @@ func readFirstSSEMessage(r io.Reader, wantID string) ([]byte, error) {
 			inEvent = true
 			// Spec: strip exactly one leading space after the colon.
 			payload := strings.TrimPrefix(line, "data:")
-			if strings.HasPrefix(payload, " ") {
-				payload = payload[1:]
-			}
+			payload = strings.TrimPrefix(payload, " ")
 			dataLines = append(dataLines, payload)
-		case strings.HasPrefix(line, "id:"):
-			// Event-stream id (Last-Event-ID) — NOT a correlation id.
-			// Ignored for matching; see comment above.
-		case strings.HasPrefix(line, "event:"):
-			// Event type is informational; we match on id only.
-		case strings.HasPrefix(line, "retry:"):
-			// Ignore.
 		default:
-			// Comment or unknown field: ignore.
+			// id: (event-stream id / Last-Event-ID — NOT a correlation
+			// id), event:, retry:, comments, and unknown fields: ignore.
 		}
 	}
 	if err := scanner.Err(); err != nil {

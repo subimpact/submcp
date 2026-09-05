@@ -54,12 +54,15 @@ func main() {
 
 	// Wire the gateway.
 	pool := mcp.NewPool(cfg.MaxTotalConns, cfg.MaxConnsPerServer, 5*time.Minute)
-	agg := mcp.NewAggregator(pool, dbPool)
+	// P1-3: SSRF guard — always block metadata/loopback; RFC1918 allowed
+	// per ALLOW_PRIVATE_UPSTREAMS (default ON self-hosted).
+	agg := mcp.NewAggregatorWithSSRF(pool, dbPool, mcp.NewSSRFGuard(cfg.AllowPrivateUpstreams))
 	auth := mcp.NewAuth(dbPool)
 	srv := mcp.NewServer(dbPool, agg, pool, auth, cfg.SessionLifetime)
 
-	// Admin UI (embedded, mounted at /).
-	adminUI := ui.New(dbPool)
+	// Admin UI (embedded, mounted at /). P2-3: optional admin IP
+	// allowlist via ADMIN_IP_ALLOWLIST (empty = allow all).
+	adminUI := ui.NewWithAllowlist(dbPool, cfg.AdminIPAllowlist)
 
 	// Root handler: gateway routes + admin UI.
 	root := http.NewServeMux()
@@ -90,6 +93,12 @@ func main() {
 		Addr:              cfg.ListenAddr,
 		Handler:           handler,
 		ReadHeaderTimeout: 10 * time.Second,
+		// P2-7: ReadTimeout bounds slow-loris body reads; IdleTimeout
+		// reaps idle keep-alive conns. WriteTimeout is deliberately NOT
+		// set — SSE streams (streamable GET, legacy /sse) are long-lived
+		// and a write deadline would kill them mid-stream.
+		ReadTimeout:  30 * time.Second,
+		IdleTimeout:  120 * time.Second,
 	}
 
 	go func() {

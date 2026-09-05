@@ -86,6 +86,11 @@ func (t Tool) MarshalJSON() ([]byte, error) {
 		out["description"] = *t.Description
 	}
 	out["inputSchema"] = json.RawMessage(t.InputSchema)
+	// P2-2: an upstream that omits inputSchema must not emit null — the
+	// MCP spec requires an object; default to an empty object schema.
+	if len(t.InputSchema) == 0 || string(t.InputSchema) == "null" {
+		out["inputSchema"] = json.RawMessage(`{"type":"object"}`)
+	}
 	if t.Annotations != nil {
 		out["annotations"] = t.Annotations
 	}
