@@ -216,7 +216,11 @@ func (a *Aggregator) ListTools(ctx context.Context, namespaceUUID string) ([]Too
 				// tools without mappings pass through untouched).
 				if ov, ok := overrideByKey[k]; ok {
 					if ov.OverrideName != nil {
-						t.Name = *ov.OverrideName
+						// P0-1.3: the override replaces the TOOL part
+						// only — the server prefix must survive
+						// (parity with tool-overrides.functional.ts:
+						// `${parsed.serverName}__${override.overrideName}`).
+						t.Name = prefix + *ov.OverrideName
 					}
 					if ov.OverrideDesc != nil {
 						t.Description = ov.OverrideDesc
@@ -283,11 +287,60 @@ func (a *Aggregator) CallTool(ctx context.Context, namespaceUUID, sessionID, too
 		return nil, err
 	}
 
+	// P0-1.2/P0-1.3: consult namespace tool mappings on the CALL path.
+	// - INACTIVE mappings must block the call with an isError result
+	//   (parity with createFilterCallToolMiddleware).
+	// - override_name must reverse-map to the original tool name before
+	//   dispatch (parity with mapOverrideNameToOriginal).
+	mappings, err := a.db.GetToolMappings(ctx, namespaceUUID)
+	if err != nil {
+		return nil, err
+	}
+	// reverseOverride: "serverName__overrideName" -> (originalName, serverUUID, active)
+	type revKey struct{ server, override string }
+	reverseOverride := make(map[revKey]struct {
+		original string
+		server   string
+		active   bool
+	})
+	for _, m := range mappings {
+		if m.Mapping.OverrideName == nil {
+			continue
+		}
+		// The mapping's server name is the DB server name; the client
+		// sees the sanitized prefix.
+		rev := revKey{SanitizeName(serverNameFor(m.Mapping.MCPServerUUID, servers)), *m.Mapping.OverrideName}
+		reverseOverride[rev] = struct {
+			original string
+			server   string
+			active   bool
+		}{m.Tool.Name, m.Mapping.MCPServerUUID, m.Mapping.Status == db.ServerStatusActive}
+	}
+
+	// If the called name is an override, resolve to the original.
+	serverUUID := ""
+	dispatchName := originalName
+	if rv, ok := reverseOverride[revKey{serverName, originalName}]; ok {
+		if !rv.active {
+			// P0-1.2: INACTIVE tool — successful result carrying isError
+			// (the original's filter middleware shape).
+			denied := fmt.Sprintf("Access denied to tool %q: Tool has been marked as inactive in this namespace", toolName)
+			b, _ := json.Marshal(map[string]any{
+				"content": []map[string]any{{"type": "text", "text": denied}},
+				"isError": true,
+			})
+			return b, nil
+		}
+		serverUUID = rv.server
+		dispatchName = rv.original
+	}
+
 	// Route via the map (build on demand if stale/missing — P1-18
 	// build-on-demand for CallTool-before-ListTools).
-	serverUUID := ""
-	if routeMap, err := a.buildRouteMap(ctx, namespaceUUID, servers); err == nil {
-		serverUUID = routeMap[toolName]
+	if serverUUID == "" {
+		if routeMap, err := a.buildRouteMap(ctx, namespaceUUID, servers); err == nil {
+			serverUUID = routeMap[toolName]
+		}
 	}
 	if serverUUID == "" {
 		// Fall back to prefix matching (server may be new, or the tool
@@ -355,7 +408,7 @@ func (a *Aggregator) CallTool(ctx context.Context, namespaceUUID, sessionID, too
 	}
 	defer a.pool.Release(sessionID, target.UUID, client)
 
-	res, err := client.CallTool(ctx, originalName, args)
+	res, err := client.CallTool(ctx, dispatchName, args)
 	if err != nil {
 		if b.Failure() {
 			a.quarantine(ctx, *target)
@@ -365,6 +418,16 @@ func (a *Aggregator) CallTool(ctx context.Context, namespaceUUID, sessionID, too
 	b.Success()
 	a.unquarantine(ctx, *target)
 	return res, nil
+}
+
+// serverNameFor returns the DB server name for a UUID (or "" if absent).
+func serverNameFor(uuid string, servers []db.MCPServer) string {
+	for i := range servers {
+		if servers[i].UUID == uuid {
+			return servers[i].Name
+		}
+	}
+	return ""
 }
 
 // getServerTools returns PREFIXED tools for a server, using the 60s cache.

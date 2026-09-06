@@ -307,44 +307,90 @@ func TestEndpointEnumerationStripsSensitive(t *testing.T) {
 	}
 }
 
-// TestAuthScoping: a key owned by user X must be rejected on an endpoint
-// owned by user Y (P0-6).
+// TestAuthScoping exercises the REAL Auth.Authenticate against a fake
+// key store (P0-1.5): public keys must not reach private endpoints, and
+// private keys only reach their own endpoints.
 func TestAuthScoping(t *testing.T) {
-	// Key owned by user-x, endpoint owned by user-y.
-	key := &db.APIKey{UserID: strPtr("user-x")}
-	ep := &db.Endpoint{UserID: strPtr("user-y")}
+	keys := map[string]*db.APIKey{
+		"pub-key":  {UserID: nil},
+		"x-key":    {UserID: strPtr("user-x")},
+		"y-key":    {UserID: strPtr("user-y")},
+	}
+	fdb := &fakeKeyDB{keys: keys}
+	a := NewAuth(fdb)
 
-	a := &Auth{}
+	cases := []struct {
+		name     string
+		key      string
+		epUser   *string
+		wantCode int
+	}{
+		{"public key on public endpoint", "pub-key", nil, http.StatusOK},
+		{"public key on private endpoint (P0-1.5)", "pub-key", strPtr("user-x"), http.StatusForbidden},
+		{"own key on own endpoint", "x-key", strPtr("user-x"), http.StatusOK},
+		{"other key on endpoint", "y-key", strPtr("user-x"), http.StatusForbidden},
+		{"private key on public endpoint", "x-key", nil, http.StatusOK},
+		{"bad key", "nope", nil, http.StatusUnauthorized},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			ep := &db.Endpoint{UserID: tc.epUser, EnableAPIKeyAuth: true}
+			rr := httptest.NewRecorder()
+			req := httptest.NewRequest(http.MethodPost, "/metamcp/x/mcp", nil)
+			if tc.key != "" {
+				req.Header.Set("X-API-Key", tc.key)
+			}
+			ok := a.Authenticate(rr, req, ep)
+			if tc.wantCode == http.StatusOK && !ok {
+				t.Fatalf("expected allow, got deny: %s", rr.Body.String())
+			}
+			if tc.wantCode != http.StatusOK && ok {
+				t.Fatalf("expected deny, got allow")
+			}
+			if rr.Code != tc.wantCode {
+				t.Fatalf("status = %d, want %d (body %s)", rr.Code, tc.wantCode, rr.Body.String())
+			}
+		})
+	}
+}
+
+// TestOAuthOnlyEndpointDenied (P0-1.4): an OAuth-only endpoint must issue
+// the challenge and deny — submcp cannot validate OAuth tokens.
+func TestOAuthOnlyEndpointDenied(t *testing.T) {
+	a := NewAuth(&fakeKeyDB{keys: map[string]*db.APIKey{}})
+	ep := &db.Endpoint{EnableAPIKeyAuth: false, EnableOAuth: true}
 	rr := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodPost, "/metamcp/x/mcp", nil)
-
-	// We can't easily inject the fake key into Auth without a DB, so test
-	// the scoping predicate directly via a small helper mirror.
-	// Instead: exercise the real check by constructing the same logic.
-	allowed := key.UserID == nil || ep.UserID == nil || *key.UserID == *ep.UserID
-	if allowed {
-		t.Fatalf("key from user-x must NOT access endpoint of user-y")
+	if a.Authenticate(rr, req, ep) {
+		t.Fatalf("OAuth-only endpoint must deny (no OAuth support)")
 	}
-
-	// Same user -> allowed.
-	key2 := &db.APIKey{UserID: strPtr("user-x")}
-	ep2 := &db.Endpoint{UserID: strPtr("user-x")}
-	allowed2 := key2.UserID == nil || ep2.UserID == nil || *key2.UserID == *ep2.UserID
-	if !allowed2 {
-		t.Fatalf("key from user-x must access endpoint of user-x")
+	if rr.Code != http.StatusUnauthorized {
+		t.Fatalf("status = %d, want 401", rr.Code)
 	}
-
-	// NULL == NULL -> allowed (single-tenant).
-	key3 := &db.APIKey{UserID: nil}
-	ep3 := &db.Endpoint{UserID: nil}
-	allowed3 := key3.UserID == nil || ep3.UserID == nil || *key3.UserID == *ep3.UserID
-	if !allowed3 {
-		t.Fatalf("NULL == NULL must be allowed in single-tenant mode")
+	if ww := rr.Header().Get("WWW-Authenticate"); !strings.Contains(ww, `Bearer realm="MetaMCP"`) {
+		t.Fatalf("missing WWW-Authenticate challenge: %q", ww)
 	}
+	var body map[string]any
+	_ = json.Unmarshal(rr.Body.Bytes(), &body)
+	if body["error"] != "authentication_required" {
+		t.Fatalf("error = %v, want authentication_required", body["error"])
+	}
+	if body["resource_metadata"] == nil {
+		t.Fatalf("missing resource_metadata in challenge body")
+	}
+}
 
-	_ = a
-	_ = rr
-	_ = req
+// fakeKeyDB is a minimal KeyValidator for auth tests.
+type fakeKeyDB struct {
+	keys map[string]*db.APIKey
+}
+
+func (f *fakeKeyDB) ValidateAPIKey(_ context.Context, key string) (*db.APIKey, error) {
+	k, ok := f.keys[key]
+	if !ok {
+		return nil, nil
+	}
+	return k, nil
 }
 
 func strPtr(s string) *string { return &s }

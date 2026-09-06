@@ -1,9 +1,11 @@
 package mcp
 
 import (
+	"context"
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"strings"
 	"time"
@@ -11,26 +13,49 @@ import (
 	"github.com/subimpact/submcp/internal/db"
 )
 
+// KeyValidator is the DB surface Auth needs (extracted for tests — the
+// old TestAuthScoping re-implemented the predicate inline and could not
+// catch regressions in the real check).
+type KeyValidator interface {
+	ValidateAPIKey(ctx context.Context, key string) (*db.APIKey, error)
+}
+
 // Auth implements API-key authentication, mirroring the original
 // api-key-oauth.middleware.ts behavior:
 //   - X-API-Key header
-//   - Authorization: Bearer <key>
+//   - Authorization: Bearer ***
 //   - query param (api_key or apikey) when the endpoint allows it
 //   - 401 with the exact error shapes captured in fixtures
 type Auth struct {
-	db *db.Pool
+	db KeyValidator
 }
 
 // NewAuth creates the authenticator.
-func NewAuth(dbPool *db.Pool) *Auth {
+func NewAuth(dbPool KeyValidator) *Auth {
 	return &Auth{db: dbPool}
 }
 
 // Authenticate checks the request against the endpoint's auth config.
 // Returns true if authorized; on failure writes the 401 and returns false.
 func (a *Auth) Authenticate(w http.ResponseWriter, r *http.Request, ep *db.Endpoint) bool {
+	// P0-1.4: OAuth-only endpoints. submcp does not implement OAuth, so
+	// we cannot validate OAuth tokens — the secure parity behavior is to
+	// always issue the OAuth challenge (deny). The original would accept
+	// a valid OAuth token here; we must NOT silently allow.
+	if !ep.EnableAPIKeyAuth && ep.EnableOAuth {
+		writeOAuthChallenge(w, r, ep)
+		return false
+	}
+
 	key := extractKey(r, ep.UseQueryParamAuth)
 	if key == "" {
+		// P0-1.4: when both API key and OAuth are enabled, the original
+		// issues the OAuth challenge (which lists API key methods too),
+		// not a plain api-key 401.
+		if ep.EnableOAuth {
+			writeOAuthChallenge(w, r, ep)
+			return false
+		}
 		writeAuthError(w, http.StatusUnauthorized, "authentication_required",
 			"Authentication required via API key",
 			[]string{"X-API-Key header", "query parameter (api_key or apikey)"})
@@ -44,17 +69,68 @@ func (a *Auth) Authenticate(w http.ResponseWriter, r *http.Request, ep *db.Endpo
 		return false
 	}
 
-	// Tenant scoping (P0-6): a key may only access endpoints owned by the
-	// same user. NULL == NULL is allowed for single-tenant deployments
-	// where user_id is unset on both sides; once multi-tenant lands,
-	// NULL becomes a hard reject.
-	if apiKey.UserID != nil && ep.UserID != nil && *apiKey.UserID != *ep.UserID {
-		writeAuthError(w, http.StatusForbidden, "forbidden",
-			"API key does not have access to this endpoint", nil)
+	// P0-1.5: tenant scoping — mirror the original's checkApiKeyAccess
+	// exactly. A PUBLIC key (user_id NULL) may NOT reach a PRIVATE
+	// endpoint (user_id non-NULL); a private key may only reach its own
+	// endpoint or public endpoints.
+	isPublicKey := apiKey.UserID == nil
+	isPrivateEndpoint := ep.UserID != nil
+	if isPublicKey && isPrivateEndpoint {
+		writeAccessDenied(w, "Public API keys cannot access private endpoints. Use a private API key owned by the endpoint owner.")
+		return false
+	}
+	if !isPublicKey && isPrivateEndpoint && *apiKey.UserID != *ep.UserID {
+		writeAccessDenied(w, "You can only access endpoints you own or public endpoints.")
 		return false
 	}
 
 	return true
+}
+
+// writeAccessDenied writes the original's 403 shape
+// ({error: "Access denied", message, timestamp}).
+func writeAccessDenied(w http.ResponseWriter, message string) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusForbidden)
+	json.NewEncoder(w).Encode(map[string]any{
+		"error":     "Access denied",
+		"message":   message,
+		"timestamp": time.Now().UTC().Format("2006-01-02T15:04:05.000Z"),
+	})
+}
+
+// writeOAuthChallenge writes the original's OAuth 401 challenge
+// (WWW-Authenticate + resource_metadata body). submcp cannot validate
+// OAuth tokens, so this is always a deny — but the shape matches so
+// clients that do OAuth discovery get the right signal.
+func writeOAuthChallenge(w http.ResponseWriter, r *http.Request, ep *db.Endpoint) {
+	base := "https://" + r.Host
+	challenge := []string{
+		`Bearer realm="MetaMCP"`,
+		`scope="admin"`,
+		fmt.Sprintf(`resource_metadata="%s/.well-known/oauth-protected-resource"`, base),
+	}
+	w.Header().Set("WWW-Authenticate", strings.Join(challenge, ", "))
+	authMethods := []string{"Authorization header (Bearer token)"}
+	if ep.EnableAPIKeyAuth {
+		authMethods = append(authMethods, "X-API-Key header")
+		if ep.UseQueryParamAuth {
+			authMethods = append(authMethods, "query parameter (api_key or apikey)")
+		}
+	}
+	desc := "Authentication required via OAuth bearer token"
+	if ep.EnableAPIKeyAuth {
+		desc = "Authentication required via OAuth bearer token or API key"
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusUnauthorized)
+	json.NewEncoder(w).Encode(map[string]any{
+		"error":             "authentication_required",
+		"error_description": desc,
+		"resource_metadata": fmt.Sprintf("%s/.well-known/oauth-protected-resource", base),
+		"supported_methods": authMethods,
+		"timestamp":         time.Now().UTC().Format("2006-01-02T15:04:05.000Z"),
+	})
 }
 
 // extractKey pulls the API key from header, bearer, or query param.

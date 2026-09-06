@@ -36,6 +36,12 @@ type Server struct {
 	sessions  *SessionStore
 	startTime time.Time
 	limiter   *RateLimiter
+
+	// P0-1.11: legacy SSE response channels. handleSSEMessage delivers
+	// JSON-RPC responses over the open SSE stream (parity with the SDK's
+	// SSEServerTransport.handlePostMessage), not in the POST body.
+	sseMu    sync.Mutex
+	sseChans map[string]chan json.RawMessage // sessionID -> response channel
 }
 
 // NewServer wires the HTTP server. sessionTTL is the downstream session
@@ -49,6 +55,7 @@ func NewServer(dbPool EndpointStore, agg *Aggregator, pool *Pool, auth *Auth, se
 		sessions:  NewSessionStore(sessionTTL),
 		startTime: time.Now(),
 		limiter:   NewRateLimiter(60, 60), // P1-6: 60 req/min per IP
+		sseChans:  make(map[string]chan json.RawMessage),
 	}
 }
 
@@ -433,7 +440,9 @@ func (s *Server) handleDelete(w http.ResponseWriter, r *http.Request, ep *db.End
 }
 
 // handleSSE implements the legacy SSE transport: GET /sse opens a stream
-// and emits an endpoint event with a message URL.
+// and emits an endpoint event with a message URL. JSON-RPC responses to
+// POST /message are delivered over this stream (P0-1.11 parity with the
+// SDK's SSEServerTransport).
 func (s *Server) handleSSE(w http.ResponseWriter, r *http.Request, ep *db.Endpoint) {
 	flusher, ok := w.(http.Flusher)
 	if !ok {
@@ -446,6 +455,17 @@ func (s *Server) handleSSE(w http.ResponseWriter, r *http.Request, ep *db.Endpoi
 
 	sessionID := newUUID()
 	s.sessions.Put(sessionID, ep.NamespaceUUID, ep.UUID)
+
+	// Register the response channel for this session.
+	ch := make(chan json.RawMessage, 16)
+	s.sseMu.Lock()
+	s.sseChans[sessionID] = ch
+	s.sseMu.Unlock()
+	defer func() {
+		s.sseMu.Lock()
+		delete(s.sseChans, sessionID)
+		s.sseMu.Unlock()
+	}()
 
 	// Emit the endpoint event (parity with captured fixture).
 	msgURL := fmt.Sprintf("/metamcp/%s/message?sessionId=%s", ep.Name, sessionID)
@@ -462,6 +482,11 @@ func (s *Server) handleSSE(w http.ResponseWriter, r *http.Request, ep *db.Endpoi
 			s.sessions.Delete(sessionID)
 			s.pool.ReleaseSession(sessionID)
 			return
+		case resp := <-ch:
+			// Deliver a JSON-RPC response as an SSE message frame.
+			_, _ = io.WriteString(w, "event: message\n")
+			_, _ = io.WriteString(w, "data: "+string(resp)+"\n\n")
+			flusher.Flush()
 		case <-ticker.C:
 			_, _ = io.WriteString(w, ": heartbeat\n\n")
 			flusher.Flush()
@@ -532,12 +557,29 @@ func (s *Server) handleSSEMessage(w http.ResponseWriter, r *http.Request, ep *db
 		return
 	}
 
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]any{
+	// P0-1.11: deliver the response over the SSE stream (parity with the
+	// SDK's handlePostMessage: POST returns 202, the response arrives as
+	// an event: message frame on the open GET /sse stream).
+	s.sseMu.Lock()
+	ch, ok := s.sseChans[sessionID]
+	s.sseMu.Unlock()
+	if !ok {
+		// Stream gone (client disconnected) — nothing to deliver to.
+		w.WriteHeader(http.StatusAccepted)
+		return
+	}
+	resp, _ := json.Marshal(map[string]any{
 		"jsonrpc": "2.0",
 		"id":      req.ID,
 		"result":  json.RawMessage(result),
 	})
+	select {
+	case ch <- resp:
+		w.WriteHeader(http.StatusAccepted)
+	case <-time.After(5 * time.Second):
+		// Stream not reading (slow client) — drop rather than hang.
+		w.WriteHeader(http.StatusAccepted)
+	}
 }
 
 // --- helpers ---

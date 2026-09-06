@@ -145,3 +145,13 @@ func (r *statusRecorder) WriteHeader(status int) {
 	r.status = status
 	r.ResponseWriter.WriteHeader(status)
 }
+
+// Flush implements http.Flusher so SSE streams survive the logging
+// wrapper (P0-1.1: without this, both SSE endpoints 500 in production —
+// the type assertion w.(http.Flusher) fails because the embedded
+// interface does not promote Flush).
+func (r *statusRecorder) Flush() {
+	if f, ok := r.ResponseWriter.(http.Flusher); ok {
+		f.Flush()
+	}
+}
