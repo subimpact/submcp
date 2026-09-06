@@ -12,6 +12,7 @@ import (
 
 	"github.com/subimpact/submcp/internal/config"
 	"github.com/subimpact/submcp/internal/db"
+	"github.com/subimpact/submcp/internal/httpapi"
 	"github.com/subimpact/submcp/internal/mcp"
 	"github.com/subimpact/submcp/internal/ui"
 )
@@ -64,17 +65,10 @@ func main() {
 	// allowlist via ADMIN_IP_ALLOWLIST (empty = allow all).
 	adminUI := ui.NewWithAllowlist(dbPool, cfg.AdminIPAllowlist)
 
-	// Root handler: gateway routes + admin UI.
-	root := http.NewServeMux()
-	root.Handle("/", adminUI.Handler())
-	root.Handle("/health", srv.Handler())
-	root.Handle("/ready", srv.Handler())
-	root.Handle("/metrics", srv.Handler())
-	root.Handle("/metamcp/", srv.Handler())
-
-	// Request logging middleware (P1-14): method, path, status, duration,
-	// client IP, and a request ID for correlation.
-	handler := withRequestLogging(logger, root)
+	// Root handler: gateway routes + admin UI, wrapped in request
+	// logging (P1-14). Assembled in internal/httpapi so tests drive the
+	// same chain the deployed binary serves.
+	handler := httpapi.Build(logger, srv, adminUI)
 
 	// Idle sweep + session TTL sweep (P1-4).
 	go func() {
@@ -116,42 +110,4 @@ func main() {
 	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer shutdownCancel()
 	_ = httpServer.Shutdown(shutdownCtx)
-}
-
-// withRequestLogging wraps a handler with structured request logging.
-func withRequestLogging(logger *slog.Logger, next http.Handler) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		start := time.Now()
-		rec := &statusRecorder{ResponseWriter: w, status: http.StatusOK}
-		next.ServeHTTP(rec, r)
-		logger.Info("request",
-			"method", r.Method,
-			"path", r.URL.Path,
-			"status", rec.status,
-			"duration_ms", time.Since(start).Milliseconds(),
-			"ip", r.RemoteAddr,
-			"ua", r.UserAgent(),
-		)
-	})
-}
-
-// statusRecorder captures the response status for logging.
-type statusRecorder struct {
-	http.ResponseWriter
-	status int
-}
-
-func (r *statusRecorder) WriteHeader(status int) {
-	r.status = status
-	r.ResponseWriter.WriteHeader(status)
-}
-
-// Flush implements http.Flusher so SSE streams survive the logging
-// wrapper (P0-1.1: without this, both SSE endpoints 500 in production —
-// the type assertion w.(http.Flusher) fails because the embedded
-// interface does not promote Flush).
-func (r *statusRecorder) Flush() {
-	if f, ok := r.ResponseWriter.(http.Flusher); ok {
-		f.Flush()
-	}
 }

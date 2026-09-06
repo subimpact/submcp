@@ -59,6 +59,11 @@ func NewServer(dbPool EndpointStore, agg *Aggregator, pool *Pool, auth *Auth, se
 	}
 }
 
+// SetRateLimiter replaces the default per-IP limiter (test hook).
+func (s *Server) SetRateLimiter(l *RateLimiter) {
+	s.limiter = l
+}
+
 // Handler returns the root http.Handler.
 func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
