@@ -56,3 +56,18 @@ WHERE user_id IS NULL;
 
 CREATE INDEX IF NOT EXISTS tenants_slug_idx ON tenants (slug);
 CREATE INDEX IF NOT EXISTS usage_daily_tenant_day_idx ON usage_daily (tenant_id, day);
+
+-- Multi-tenant endpoint uniqueness: the original global UNIQUE (name)
+-- blocks two tenants from both having an endpoint named "all". The
+-- per-tenant key is (name, user_id); NULL user_id rows (legacy root) are
+-- still pairwise-distinct in Postgres, so single-tenant behavior is
+-- preserved exactly.
+ALTER TABLE endpoints DROP CONSTRAINT IF EXISTS endpoints_name_unique;
+DO $$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_constraint WHERE conname = 'endpoints_name_user_unique_idx'
+    ) THEN
+        ALTER TABLE endpoints ADD CONSTRAINT endpoints_name_user_unique_idx UNIQUE (name, user_id);
+    END IF;
+END $$;

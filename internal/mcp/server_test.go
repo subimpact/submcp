@@ -21,6 +21,15 @@ func (f *fakeDB) GetEndpointByName(_ context.Context, name string) (*db.Endpoint
 	return f.endpoints[name], nil
 }
 
+func (f *fakeDB) GetEndpointByNameForUser(_ context.Context, name, userID string) (*db.Endpoint, error) {
+	for _, e := range f.endpoints {
+		if e.Name == name && e.UserID != nil && *e.UserID == userID {
+			return e, nil
+		}
+	}
+	return nil, nil
+}
+
 func (f *fakeDB) ListEndpoints(_ context.Context) ([]db.Endpoint, error) {
 	var out []db.Endpoint
 	for _, e := range f.endpoints {

@@ -33,6 +33,14 @@ type fakeEndpointStore struct {
 func (f *fakeEndpointStore) GetEndpointByName(_ context.Context, name string) (*db.Endpoint, error) {
 	return f.endpoints[name], nil
 }
+func (f *fakeEndpointStore) GetEndpointByNameForUser(_ context.Context, name, userID string) (*db.Endpoint, error) {
+	for _, e := range f.endpoints {
+		if e.Name == name && e.UserID != nil && *e.UserID == userID {
+			return e, nil
+		}
+	}
+	return nil, nil
+}
 func (f *fakeEndpointStore) ListEndpoints(_ context.Context) ([]db.Endpoint, error) {
 	var out []db.Endpoint
 	for _, e := range f.endpoints {

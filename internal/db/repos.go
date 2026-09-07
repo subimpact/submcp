@@ -119,12 +119,34 @@ type APIKey struct {
 	IsAdmin   bool      `json:"is_admin"`
 }
 
-// GetEndpointByName looks up an endpoint by its public name.
+// GetEndpointByName looks up an endpoint by its public name (legacy
+// single-tenant path: bare-host operator access).
 func (p *Pool) GetEndpointByName(ctx context.Context, name string) (*Endpoint, error) {
 	row := p.QueryRow(ctx, `
 		SELECT uuid, name, description, namespace_uuid, enable_api_key_auth,
 		       use_query_param_auth, created_at, updated_at, user_id, enable_oauth
 		FROM endpoints WHERE name = $1`, name)
+	var e Endpoint
+	err := row.Scan(&e.UUID, &e.Name, &e.Description, &e.NamespaceUUID,
+		&e.EnableAPIKeyAuth, &e.UseQueryParamAuth, &e.CreatedAt, &e.UpdatedAt,
+		&e.UserID, &e.EnableOAuth)
+	if err == pgx.ErrNoRows {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	return &e, nil
+}
+
+// GetEndpointByNameForUser looks up an endpoint by name scoped to a
+// tenant owner (SaaS Phase 1: tenant subdomain path). Multiple tenants may
+// each own an endpoint named "all"; the tenant's own row is returned.
+func (p *Pool) GetEndpointByNameForUser(ctx context.Context, name, userID string) (*Endpoint, error) {
+	row := p.QueryRow(ctx, `
+		SELECT uuid, name, description, namespace_uuid, enable_api_key_auth,
+		       use_query_param_auth, created_at, updated_at, user_id, enable_oauth
+		FROM endpoints WHERE name = $1 AND user_id = $2`, name, userID)
 	var e Endpoint
 	err := row.Scan(&e.UUID, &e.Name, &e.Description, &e.NamespaceUUID,
 		&e.EnableAPIKeyAuth, &e.UseQueryParamAuth, &e.CreatedAt, &e.UpdatedAt,

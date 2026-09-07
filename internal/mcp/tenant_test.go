@@ -187,32 +187,20 @@ func TestResolveTenantHostBinding(t *testing.T) {
 	s := &Server{tenants: &tenantGate{store: store, baseHost: "mcp.subimpact.net", trialDailyCap: 100}}
 	ep := &db.Endpoint{UUID: "ep1", Name: "all", UserID: strptr("u1")}
 
-	// Correct host -> tenant resolved.
+	// Correct host -> tenant resolved by slug, ownership verified.
 	req := httptest.NewRequest(http.MethodPost, "https://acme.mcp.subimpact.net/metamcp/all/mcp", nil)
-	tnt, err := s.resolveTenant(req, ep)
+	tnt, err := s.resolveTenantByOwner(req, ep)
 	if err != nil {
-		t.Fatalf("resolveTenant correct host: %v", err)
+		t.Fatalf("resolveTenantByOwner: %v", err)
 	}
 	if tnt == nil || tnt.Slug != "acme" {
 		t.Fatalf("expected acme tenant, got %+v", tnt)
 	}
 
-	// Wrong tenant host -> cross-tenant error.
-	req2 := httptest.NewRequest(http.MethodPost, "https://other.mcp.subimpact.net/metamcp/all/mcp", nil)
-	if _, err := s.resolveTenant(req2, ep); err != errCrossTenantHost {
-		t.Fatalf("expected errCrossTenantHost, got %v", err)
-	}
-
-	// Unknown tenant host -> unknown error.
-	req3 := httptest.NewRequest(http.MethodPost, "https://nobody.mcp.subimpact.net/metamcp/all/mcp", nil)
-	if _, err := s.resolveTenant(req3, ep); err != errUnknownTenantHost {
-		t.Fatalf("expected errUnknownTenantHost, got %v", err)
-	}
-
 	// Legacy mode (no gate) -> no tenant, no error.
 	s2 := &Server{}
 	req4 := httptest.NewRequest(http.MethodPost, "https://anything.example.com/metamcp/all/mcp", nil)
-	tnt2, err := s2.resolveTenant(req4, ep)
+	tnt2, err := s2.resolveTenantByOwner(req4, ep)
 	if err != nil || tnt2 != nil {
 		t.Fatalf("legacy mode should return nil, nil; got %+v, %v", tnt2, err)
 	}

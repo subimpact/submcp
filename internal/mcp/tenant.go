@@ -3,22 +3,11 @@ package mcp
 import (
 	"context"
 	"encoding/json"
-	"errors"
 	"net/http"
 	"strings"
 	"time"
 
 	"github.com/subimpact/submcp/internal/db"
-)
-
-// Tenant resolution errors (distinct codes for the gateway to map).
-var (
-	// errUnknownTenantHost: request arrived on <slug>.<baseHost> but no
-	// such tenant exists.
-	errUnknownTenantHost = errors.New("unknown tenant host")
-	// errCrossTenantHost: the request's tenant host does not own the
-	// endpoint being accessed.
-	errCrossTenantHost = errors.New("endpoint not owned by tenant host")
 )
 
 // TenantStore is the DB surface the gateway needs for tenant entitlement

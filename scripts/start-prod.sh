@@ -54,6 +54,8 @@ docker run -d --name submcp-prod --restart unless-stopped \
   -e POSTGRES_PASSWORD="$POSTGRES_PASSWORD" \
   -e POSTGRES_DB="$POSTGRES_DB" \
   -e LISTEN_ADDR=:12008 \
+  -e TENANT_BASE_HOST="$TENANT_BASE_HOST" \
+  -e TRIAL_DAILY_LIMIT="$TRIAL_DAILY_LIMIT" \
   "${ARGS[@]}" \
   submcp:prod
 
