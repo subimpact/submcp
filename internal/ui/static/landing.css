@@ -77,8 +77,8 @@ p { margin: 0; }
 .stat-label { color: var(--muted); font-size: 0.8rem; text-transform: uppercase; letter-spacing: 0.08em; }
 .stats-note { grid-column: 1 / -1; color: var(--muted); font-size: 0.75rem; font-family: var(--mono); margin-top: 4px; }
 
-/* sections */
-.features, .how, .upstreams, .support {
+/* section list */
+.features, .how, .upstreams, .pricing, .support {
   max-width: 1100px; margin: 0 auto; padding: 64px 24px;
   border-top: 1px solid var(--border);
 }
@@ -114,6 +114,29 @@ p { margin: 0; }
 .upstream-status.ok { color: var(--green); }
 .upstream-status.err { color: var(--red); }
 
+/* pricing */
+.pricing {
+  max-width: 1100px; margin: 0 auto; padding: 64px 24px;
+  border-top: 1px solid var(--border);
+}
+.pricing h2 { margin-bottom: 0.5rem; }
+.pricing-cards {
+  display: grid; grid-template-columns: repeat(2, 1fr); gap: 16px;
+  max-width: 800px; margin-top: 32px;
+}
+.price-card {
+  background: var(--panel); border: 1px solid var(--border); border-radius: 12px;
+  padding: 28px; display: flex; flex-direction: column;
+}
+.price-card-featured { border-color: var(--accent); box-shadow: 0 0 0 1px var(--accent), 0 12px 32px rgba(79, 140, 255, 0.10); }
+.price-num { font-size: 2.6rem; font-weight: 700; letter-spacing: -0.03em; margin: 10px 0 2px; }
+.price-num span { font-size: 1rem; color: var(--muted); font-weight: 400; }
+.price-period { color: var(--muted); font-size: 0.85rem; margin-bottom: 18px; }
+.price-card ul { list-style: none; padding: 0; margin: 0 0 24px; flex: 1; }
+.price-card li { padding: 7px 0 7px 24px; position: relative; color: var(--muted); font-size: 0.92rem; }
+.price-card li::before { content: "✓"; position: absolute; left: 0; color: var(--green); font-weight: 700; }
+.price-card .btn { text-align: center; }
+
 /* support */
 .support { text-align: center; }
 .support h2 { margin-bottom: 0.5rem; }
@@ -134,5 +157,6 @@ footer { border-top: 1px solid var(--border); padding: 24px; }
   .feature-grid { grid-template-columns: 1fr; }
   .feature-wide { grid-column: span 1; }
   .steps { grid-template-columns: 1fr; }
+  .pricing-cards { grid-template-columns: 1fr; }
   .nav-links { display: none; }
 }

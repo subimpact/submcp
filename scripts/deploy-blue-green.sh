@@ -59,6 +59,22 @@ LABELS=(
   "traefik.http.routers.https-0-submcp-prod-next.tls.certresolver=letsencrypt"
   "traefik.http.services.http-0-submcp-prod-next.loadbalancer.server.port=12008"
   "traefik.http.services.https-0-submcp-prod-next.loadbalancer.server.port=12008"
+  # Tenant subdomain wildcard (SaaS Phase 1): *.mcp.subimpact.net ->
+  # the same gateway container. Per-host LE certs via HTTP-01.
+  "traefik.http.routers.http-1-submcp-tenant-next.entryPoints=http"
+  "traefik.http.routers.http-1-submcp-tenant-next.middlewares=redirect-to-https"
+  "traefik.http.routers.http-1-submcp-tenant-next.rule=HostRegexp(`{subdomain:[a-z0-9-]+}.mcp.subimpact.net`)"
+  "traefik.http.routers.http-1-submcp-tenant-next.service=http-1-submcp-tenant-next"
+  "traefik.http.routers.http-1-submcp-tenant-next.priority=2"
+  "traefik.http.routers.https-1-submcp-tenant-next.entryPoints=https"
+  "traefik.http.routers.https-1-submcp-tenant-next.middlewares=gzip"
+  "traefik.http.routers.https-1-submcp-tenant-next.rule=HostRegexp(`{subdomain:[a-z0-9-]+}.mcp.subimpact.net`)"
+  "traefik.http.routers.https-1-submcp-tenant-next.service=https-1-submcp-tenant-next"
+  "traefik.http.routers.https-1-submcp-tenant-next.priority=2"
+  "traefik.http.routers.https-1-submcp-tenant-next.tls=true"
+  "traefik.http.routers.https-1-submcp-tenant-next.tls.certresolver=letsencrypt"
+  "traefik.http.services.http-1-submcp-tenant-next.loadbalancer.server.port=12008"
+  "traefik.http.services.https-1-submcp-tenant-next.loadbalancer.server.port=12008"
 )
 
 ARGS=()
@@ -120,6 +136,7 @@ docker run -d --name submcp-prod --restart unless-stopped \
   -e TENANT_BASE_HOST="$TENANT_BASE_HOST" \
   -e TRIAL_DAILY_LIMIT="$TRIAL_DAILY_LIMIT" \
   "${ARGS[@]//submcp-prod-next/submcp-prod}" \
+  "${ARGS[@]//submcp-tenant-next/submcp-tenant-prod}" \
   "$IMAGE"
 
 echo "==> [6/6] verifying all entry points"

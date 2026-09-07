@@ -37,6 +37,21 @@ LABELS=(
   "traefik.http.routers.https-0-submcp-prod.tls.certresolver=letsencrypt"
   "traefik.http.services.http-0-submcp-prod.loadbalancer.server.port=12008"
   "traefik.http.services.https-0-submcp-prod.loadbalancer.server.port=12008"
+  # Tenant subdomain wildcard (SaaS Phase 1): *.mcp.subimpact.net
+  "traefik.http.routers.http-1-submcp-tenant-prod.entryPoints=http"
+  "traefik.http.routers.http-1-submcp-tenant-prod.middlewares=redirect-to-https"
+  "traefik.http.routers.http-1-submcp-tenant-prod.rule=HostRegexp(`{subdomain:[a-z0-9-]+}.mcp.subimpact.net`)"
+  "traefik.http.routers.http-1-submcp-tenant-prod.service=http-1-submcp-tenant-prod"
+  "traefik.http.routers.http-1-submcp-tenant-prod.priority=2"
+  "traefik.http.routers.https-1-submcp-tenant-prod.entryPoints=https"
+  "traefik.http.routers.https-1-submcp-tenant-prod.middlewares=gzip"
+  "traefik.http.routers.https-1-submcp-tenant-prod.rule=HostRegexp(`{subdomain:[a-z0-9-]+}.mcp.subimpact.net`)"
+  "traefik.http.routers.https-1-submcp-tenant-prod.service=https-1-submcp-tenant-prod"
+  "traefik.http.routers.https-1-submcp-tenant-prod.priority=2"
+  "traefik.http.routers.https-1-submcp-tenant-prod.tls=true"
+  "traefik.http.routers.https-1-submcp-tenant-prod.tls.certresolver=letsencrypt"
+  "traefik.http.services.http-1-submcp-tenant-prod.loadbalancer.server.port=12008"
+  "traefik.http.services.https-1-submcp-tenant-prod.loadbalancer.server.port=12008"
 )
 
 ARGS=()
