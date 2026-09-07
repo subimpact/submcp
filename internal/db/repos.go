@@ -287,12 +287,17 @@ func (p *Pool) CountNamespaces(ctx context.Context) (int, error) {
 
 // --- Admin UI repo methods ---
 
-// ListServers returns all MCP servers (admin view).
-func (p *Pool) ListServers(ctx context.Context) ([]MCPServer, error) {
+// ListServers returns all MCP servers for a tenant (user_id filter).
+// When userID is nil the legacy single-tenant view is preserved (all rows,
+// including NULL-user_id rows) — backward compatible with the existing
+// operator deployment.
+func (p *Pool) ListServers(ctx context.Context, userID *string) ([]MCPServer, error) {
 	rows, err := p.Query(ctx, `
 		SELECT uuid, name, description, type, command, args, env, url,
 		       created_at, bearer_token, user_id, error_status, headers
-		FROM mcp_servers ORDER BY created_at DESC`)
+		FROM mcp_servers
+		WHERE ($1::text IS NULL OR user_id = $1)
+		ORDER BY created_at DESC`, userID)
 	if err != nil {
 		return nil, err
 	}
@@ -311,12 +316,13 @@ func (p *Pool) ListServers(ctx context.Context) ([]MCPServer, error) {
 	return out, rows.Err()
 }
 
-// GetServer returns one server by UUID.
-func (p *Pool) GetServer(ctx context.Context, uuid string) (*MCPServer, error) {
+// GetServer returns one server by UUID, scoped to the owner (nil = legacy root view).
+func (p *Pool) GetServer(ctx context.Context, uuid string, userID *string) (*MCPServer, error) {
 	row := p.QueryRow(ctx, `
 		SELECT uuid, name, description, type, command, args, env, url,
 		       created_at, bearer_token, user_id, error_status, headers
-		FROM mcp_servers WHERE uuid = $1`, uuid)
+		FROM mcp_servers WHERE uuid = $1 AND ($2::text IS NULL OR user_id = $2)`,
+		uuid, userID)
 	var s MCPServer
 	err := row.Scan(&s.UUID, &s.Name, &s.Description, &s.Type, &s.Command,
 		&s.Args, &s.Env, &s.URL, &s.CreatedAt, &s.BearerToken, &s.UserID,
@@ -330,15 +336,15 @@ func (p *Pool) GetServer(ctx context.Context, uuid string) (*MCPServer, error) {
 	return &s, nil
 }
 
-// CreateServer inserts a new MCP server.
+// CreateServer inserts a new MCP server (user_id = owner; empty = legacy root).
 func (p *Pool) CreateServer(ctx context.Context, s *MCPServer) error {
 	return p.QueryRow(ctx, `
 		INSERT INTO mcp_servers (name, description, type, command, args, env, url,
-		                         bearer_token, headers)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+		                         bearer_token, headers, user_id)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
 		RETURNING uuid, created_at`,
 		s.Name, s.Description, s.Type, s.Command, s.Args, s.Env, s.URL,
-		s.BearerToken, s.Headers).Scan(&s.UUID, &s.CreatedAt)
+		s.BearerToken, s.Headers, s.UserID).Scan(&s.UUID, &s.CreatedAt)
 }
 
 // UpdateServer updates editable fields of a server.
@@ -368,11 +374,13 @@ func (p *Pool) SetServerErrorStatus(ctx context.Context, uuid string, status Err
 	return err
 }
 
-// ListNamespaces returns all namespaces.
-func (p *Pool) ListNamespaces(ctx context.Context) ([]Namespace, error) {
+// ListNamespaces returns all namespaces for a tenant (user_id filter).
+func (p *Pool) ListNamespaces(ctx context.Context, userID *string) ([]Namespace, error) {
 	rows, err := p.Query(ctx, `
 		SELECT uuid, name, description, created_at, updated_at, user_id
-		FROM namespaces ORDER BY name`)
+		FROM namespaces
+		WHERE ($1::text IS NULL OR user_id = $1)
+		ORDER BY name`, userID)
 	if err != nil {
 		return nil, err
 	}
@@ -390,12 +398,12 @@ func (p *Pool) ListNamespaces(ctx context.Context) ([]Namespace, error) {
 	return out, rows.Err()
 }
 
-// CreateNamespace inserts a new namespace.
+// CreateNamespace inserts a new namespace (user_id = owner; empty = legacy root).
 func (p *Pool) CreateNamespace(ctx context.Context, n *Namespace) error {
 	return p.QueryRow(ctx, `
-		INSERT INTO namespaces (name, description)
-		VALUES ($1, $2) RETURNING uuid, created_at, updated_at`,
-		n.Name, n.Description).Scan(&n.UUID, &n.CreatedAt, &n.UpdatedAt)
+		INSERT INTO namespaces (name, description, user_id)
+		VALUES ($1, $2, $3) RETURNING uuid, created_at, updated_at`,
+		n.Name, n.Description, n.UserID).Scan(&n.UUID, &n.CreatedAt, &n.UpdatedAt)
 }
 
 // DeleteNamespace removes a namespace (cascade removes mappings/endpoints).
@@ -437,11 +445,13 @@ func (p *Pool) SetServerMapping(ctx context.Context, namespaceUUID, serverUUID s
 	return err
 }
 
-// ListAPIKeys returns all API keys (admin view, key values included).
-func (p *Pool) ListAPIKeys(ctx context.Context) ([]APIKey, error) {
+// ListAPIKeys returns all API keys for a tenant (user_id filter).
+func (p *Pool) ListAPIKeys(ctx context.Context, userID *string) ([]APIKey, error) {
 	rows, err := p.Query(ctx, `
 		SELECT uuid, name, key, user_id, created_at, is_active, is_admin
-		FROM api_keys ORDER BY created_at DESC`)
+		FROM api_keys
+		WHERE ($1::text IS NULL OR user_id = $1)
+		ORDER BY created_at DESC`, userID)
 	if err != nil {
 		return nil, err
 	}
@@ -460,19 +470,20 @@ func (p *Pool) ListAPIKeys(ctx context.Context) ([]APIKey, error) {
 }
 
 // CreateAPIKey inserts a new API key (P2-13: stores the SHA-256 hash,
-// never the plaintext).
-func (p *Pool) CreateAPIKey(ctx context.Context, name, key string, isAdmin bool) (*APIKey, error) {
+// never the plaintext). userID nil = legacy root key.
+func (p *Pool) CreateAPIKey(ctx context.Context, name, key string, isAdmin bool, userID *string) (*APIKey, error) {
 	var k APIKey
 	err := p.QueryRow(ctx, `
-		INSERT INTO api_keys (name, key, key_hash, is_admin)
-		VALUES ($1, $2, encode(sha256($2::bytea), 'hex'), $3)
+		INSERT INTO api_keys (name, key, key_hash, is_admin, user_id)
+		VALUES ($1, $2, encode(sha256($2::bytea), 'hex'), $3, $4)
 		RETURNING uuid, created_at, is_active, is_admin`,
-		name, key, isAdmin).Scan(&k.UUID, &k.CreatedAt, &k.IsActive, &k.IsAdmin)
+		name, key, isAdmin, userID).Scan(&k.UUID, &k.CreatedAt, &k.IsActive, &k.IsAdmin)
 	if err != nil {
 		return nil, err
 	}
 	k.Name = name
 	k.Key = key
+	k.UserID = userID
 	return &k, nil
 }
 
@@ -520,15 +531,15 @@ func ValidEndpointName(name string) bool {
 	return true
 }
 
-// CreateEndpoint inserts a new endpoint.
+// CreateEndpoint inserts a new endpoint (user_id = owner; empty = legacy root).
 func (p *Pool) CreateEndpoint(ctx context.Context, e *Endpoint) error {
 	return p.QueryRow(ctx, `
 		INSERT INTO endpoints (name, description, namespace_uuid, enable_api_key_auth,
-		                       use_query_param_auth, enable_oauth)
-		VALUES ($1, $2, $3, $4, $5, $6)
+		                       use_query_param_auth, enable_oauth, user_id)
+		VALUES ($1, $2, $3, $4, $5, $6, $7)
 		RETURNING uuid, created_at, updated_at`,
 		e.Name, e.Description, e.NamespaceUUID, e.EnableAPIKeyAuth,
-		e.UseQueryParamAuth, e.EnableOAuth).Scan(&e.UUID, &e.CreatedAt, &e.UpdatedAt)
+		e.UseQueryParamAuth, e.EnableOAuth, e.UserID).Scan(&e.UUID, &e.CreatedAt, &e.UpdatedAt)
 }
 
 // UpdateEndpoint updates an endpoint.

@@ -3,6 +3,7 @@ package mcp
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -37,6 +38,9 @@ type Server struct {
 	startTime time.Time
 	limiter   *RateLimiter
 
+	// SaaS Phase 1: tenant entitlement + usage caps. nil until enabled.
+	tenants *tenantGate
+
 	// P0-1.11: legacy SSE response channels. handleSSEMessage delivers
 	// JSON-RPC responses over the open SSE stream (parity with the SDK's
 	// SSEServerTransport.handlePostMessage), not in the POST body.
@@ -62,6 +66,15 @@ func NewServer(dbPool EndpointStore, agg *Aggregator, pool *Pool, auth *Auth, se
 // SetRateLimiter replaces the default per-IP limiter (test hook).
 func (s *Server) SetRateLimiter(l *RateLimiter) {
 	s.limiter = l
+}
+
+// EnableTenants turns on tenant entitlement + trial usage caps (SaaS
+// Phase 1). store must implement the tenant DB surface; baseHost is the
+// tenant subdomain base (e.g. "mcp.subimpact.net"); trialDailyCap is the
+// tool-call cap per day for trialing tenants (0 = uncapped).
+// Disabled by default — the gateway stays fully single-tenant compatible.
+func (s *Server) EnableTenants(store TenantStore, baseHost string, trialDailyCap int64) {
+	s.tenants = &tenantGate{store: store, baseHost: baseHost, trialDailyCap: trialDailyCap}
 }
 
 // Handler returns the root http.Handler.
@@ -175,6 +188,27 @@ func (s *Server) handleMetamcp(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// SaaS Phase 1: tenant entitlement gate. Resolves the endpoint owner's
+	// tenant (nil for legacy root endpoints), denies when the trial is
+	// over / subscription canceled / payment overdue.
+	tenant, err := s.resolveTenant(r, ep)
+	if err != nil {
+		switch {
+		case errors.Is(err, errCrossTenantHost):
+			writeJSONError(w, http.StatusForbidden, "cross_tenant_access_denied",
+				"The requested endpoint does not belong to this tenant subdomain.")
+		case errors.Is(err, errUnknownTenantHost):
+			writeJSONError(w, http.StatusNotFound, "unknown_tenant",
+				"No tenant is provisioned at this subdomain.")
+		default:
+			writeJSONError(w, http.StatusInternalServerError, "internal_error", "Tenant resolution failed")
+		}
+		return
+	}
+	if s.tenants != nil && !s.tenants.checkEntitlement(w, r, tenant) {
+		return
+	}
+
 	// Auth (unless the endpoint disables it).
 	if ep.EnableAPIKeyAuth {
 		if !s.auth.Authenticate(w, r, ep) {
@@ -193,6 +227,48 @@ func (s *Server) handleMetamcp(w http.ResponseWriter, r *http.Request) {
 	default:
 		writeJSONError(w, http.StatusNotFound, "not_found", "Unknown path")
 	}
+}
+
+// resolveTenant maps an authenticated request to its tenant, enforcing the
+// tenant subdomain binding:
+//   - legacy mode (s.tenants == nil): returns nil, nil — no tenant checks.
+//   - root endpoints (user_id NULL): not tenant-managed, returns nil, nil.
+//   - <slug>.<baseHost> requests must match the endpoint owner's tenant
+//     slug, else errCrossTenantHost (403).
+//   - <unknown>.<baseHost> requests: errUnknownTenantHost (404).
+//   - bare base host: resolved by endpoint owner (admin console path).
+func (s *Server) resolveTenant(r *http.Request, ep *db.Endpoint) (*db.Tenant, error) {
+	if s.tenants == nil || s.tenants.store == nil {
+		return nil, nil
+	}
+	if ep.UserID == nil {
+		return nil, nil // legacy root endpoint — not tenant-managed
+	}
+	slug := subdomainSlug(r.Host, s.tenants.baseHost)
+	if slug != "" {
+		// Tenant-subdomain request: resolve the tenant BY SLUG, then
+		// verify it owns the endpoint. This is the tenant isolation
+		// boundary — unknown slugs 404, foreign slugs 403.
+		t, err := s.tenants.store.GetTenantBySlug(r.Context(), slug)
+		if err != nil {
+			return nil, err
+		}
+		if t == nil {
+			return nil, errUnknownTenantHost
+		}
+		if t.UserID != *ep.UserID {
+			return nil, errCrossTenantHost
+		}
+		return t, nil
+	}
+	t, err := s.tenants.store.GetTenantByUserID(r.Context(), *ep.UserID)
+	if err != nil {
+		return nil, err
+	}
+	if t == nil {
+		return nil, nil // provisioning lag — don't block
+	}
+	return t, nil
 }
 
 // handleEndpointList mirrors the original unauthenticated enumeration, but
@@ -326,10 +402,20 @@ func (s *Server) handlePost(w http.ResponseWriter, r *http.Request, ep *db.Endpo
 		if len(req.Params) > 0 {
 			_ = json.Unmarshal(req.Params, &params)
 		}
+		// SaaS Phase 1: trial usage cap (trialing tenants only).
+		if tenant, err := s.resolveTenant(r, ep); err == nil && tenant != nil {
+			if !s.tenants.allowToolCall(w, r, tenant) {
+				return
+			}
+		}
 		result, err := s.agg.CallTool(r.Context(), nsUUID, sessionID, params.Name, params.Arguments)
 		if err != nil {
 			writeSSE(w, r, newResponse(req.ID, nil, &RPCError{Code: CodeInternalError, Message: err.Error()}))
 			return
+		}
+		// SaaS Phase 1: count the successful call toward the daily cap.
+		if tenant, err := s.resolveTenant(r, ep); err == nil && tenant != nil {
+			s.tenants.bumpToolCall(r.Context(), tenant)
 		}
 		writeSSE(w, r, newResponse(req.ID, result, nil))
 	case "ping":
@@ -543,10 +629,20 @@ func (s *Server) handleSSEMessage(w http.ResponseWriter, r *http.Request, ep *db
 		if len(req.Params) > 0 {
 			_ = json.Unmarshal(req.Params, &params)
 		}
+		// SaaS Phase 1: trial usage cap (legacy SSE path parity).
+		if tenant, err := s.resolveTenant(r, ep); err == nil && tenant != nil {
+			if !s.tenants.allowToolCall(w, r, tenant) {
+				return
+			}
+		}
 		res, err := s.agg.CallTool(r.Context(), nsUUID, sessionID, params.Name, params.Arguments)
 		if err != nil {
 			writeJSONError(w, http.StatusInternalServerError, "internal_error", err.Error())
 			return
+		}
+		// SaaS Phase 1: count the successful call (legacy SSE path parity).
+		if tenant, err := s.resolveTenant(r, ep); err == nil && tenant != nil {
+			s.tenants.bumpToolCall(r.Context(), tenant)
 		}
 		result = res
 	case "ping":

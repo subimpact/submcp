@@ -60,6 +60,12 @@ func main() {
 	agg := mcp.NewAggregatorWithSSRF(pool, dbPool, mcp.NewSSRFGuard(cfg.AllowPrivateUpstreams))
 	auth := mcp.NewAuth(dbPool)
 	srv := mcp.NewServer(dbPool, agg, pool, auth, cfg.SessionLifetime)
+	// SaaS Phase 1: tenant entitlement + trial usage cap. Enabled only when
+	// a tenant base host is configured; the legacy single-tenant deployment
+	// (no TENANT_BASE_HOST) keeps working untouched.
+	if cfg.TenantBaseHost != "" {
+		srv.EnableTenants(dbPool, cfg.TenantBaseHost, cfg.TrialDailyLimit)
+	}
 
 	// Admin UI (embedded, mounted at /). P2-3: optional admin IP
 	// allowlist via ADMIN_IP_ALLOWLIST (empty = allow all).

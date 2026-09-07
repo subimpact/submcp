@@ -78,7 +78,7 @@ type fakeUIStore struct{}
 
 func (f *fakeUIStore) CountNamespaces(context.Context) (int, error) { return 0, nil }
 func (f *fakeUIStore) CountTools(context.Context) (int, error)      { return 0, nil }
-func (f *fakeUIStore) CreateAPIKey(context.Context, string, string, bool) (*db.APIKey, error) {
+func (f *fakeUIStore) CreateAPIKey(context.Context, string, string, bool, *string) (*db.APIKey, error) {
 	return nil, nil
 }
 func (f *fakeUIStore) CreateEndpoint(context.Context, *db.Endpoint) error { return nil }
@@ -89,18 +89,18 @@ func (f *fakeUIStore) CreateServer(context.Context, *db.MCPServer) error { retur
 func (f *fakeUIStore) DeleteEndpoint(context.Context, string) error     { return nil }
 func (f *fakeUIStore) DeleteNamespace(context.Context, string) error    { return nil }
 func (f *fakeUIStore) DeleteServer(context.Context, string) error        { return nil }
-func (f *fakeUIStore) GetServer(context.Context, string) (*db.MCPServer, error) {
+func (f *fakeUIStore) GetServer(context.Context, string, *string) (*db.MCPServer, error) {
 	return nil, nil
 }
-func (f *fakeUIStore) ListAPIKeys(context.Context) ([]db.APIKey, error) { return nil, nil }
+func (f *fakeUIStore) ListAPIKeys(context.Context, *string) ([]db.APIKey, error) { return nil, nil }
 func (f *fakeUIStore) ListEndpoints(context.Context) ([]db.Endpoint, error) {
 	return nil, nil
 }
 func (f *fakeUIStore) ListNamespaceServerMappings(context.Context, string) ([]db.NamespaceServerMapping, error) {
 	return nil, nil
 }
-func (f *fakeUIStore) ListNamespaces(context.Context) ([]db.Namespace, error) { return nil, nil }
-func (f *fakeUIStore) ListServers(context.Context) ([]db.MCPServer, error)    { return nil, nil }
+func (f *fakeUIStore) ListNamespaces(context.Context, *string) ([]db.Namespace, error) { return nil, nil }
+func (f *fakeUIStore) ListServers(context.Context, *string) ([]db.MCPServer, error)    { return nil, nil }
 func (f *fakeUIStore) SetAPIKeyActive(context.Context, string, bool) error    { return nil }
 func (f *fakeUIStore) SetServerMapping(context.Context, string, string, db.ServerStatus) error {
 	return nil

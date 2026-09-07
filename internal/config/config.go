@@ -36,6 +36,14 @@ type Config struct {
 	// P2-3: admin allowlist mode. Comma-separated CIDRs/IPs; when set,
 	// /api/admin/* is restricted to those source IPs (empty = allow all).
 	AdminIPAllowlist string
+
+	// SaaS (Phase 1): tenant subdomain base (e.g. ".mcp.subimpact.net").
+	// When set, gateway requests are tenant-resolved by Host; when empty
+	// the legacy single-tenant path (no tenant check) is used.
+	TenantBaseHost string
+
+	// SaaS: daily tool-call cap during trial (abuse protection). 0 = no cap.
+	TrialDailyLimit int64
 }
 
 func Get() *Config {
@@ -58,7 +66,20 @@ func Get() *Config {
 		// P2-3: empty = allow all (default); set ADMIN_IP_ALLOWLIST to
 		// restrict the admin plane (e.g. "10.0.0.0/8,203.0.113.5").
 		AdminIPAllowlist: getEnv("ADMIN_IP_ALLOWLIST", ""),
+		// SaaS tenant base host: "mcp.subimpact.net" means tenant slugs
+		// resolve from "<slug>.mcp.subimpact.net". Empty = single-tenant.
+		TenantBaseHost: getEnv("TENANT_BASE_HOST", ""),
+		TrialDailyLimit: getEnvInt64("TRIAL_DAILY_LIMIT", 0),
 	}
+}
+
+func getEnvInt64(key string, def int64) int64 {
+	if v := os.Getenv(key); v != "" {
+		if n, err := strconv.ParseInt(v, 10, 64); err == nil {
+			return n
+		}
+	}
+	return def
 }
 
 func getEnvBool(key string, def bool) bool {

@@ -23,22 +23,24 @@ var staticFS embed.FS
 
 // Store is the DB surface the admin UI needs (P2-10: extracted so the UI
 // is testable against a fake and not coupled to the concrete *db.Pool).
+// Tenant scoping (SaaS Phase 1): *string userID filters; nil = legacy
+// single-tenant view (operator root).
 type Store interface {
 	CountNamespaces(ctx context.Context) (int, error)
 	CountTools(ctx context.Context) (int, error)
-	CreateAPIKey(ctx context.Context, name, key string, isAdmin bool) (*db.APIKey, error)
+	CreateAPIKey(ctx context.Context, name, key string, isAdmin bool, userID *string) (*db.APIKey, error)
 	CreateEndpoint(ctx context.Context, e *db.Endpoint) error
 	CreateNamespace(ctx context.Context, n *db.Namespace) error
 	CreateServer(ctx context.Context, s *db.MCPServer) error
 	DeleteEndpoint(ctx context.Context, uuid string) error
 	DeleteNamespace(ctx context.Context, uuid string) error
 	DeleteServer(ctx context.Context, uuid string) error
-	GetServer(ctx context.Context, uuid string) (*db.MCPServer, error)
-	ListAPIKeys(ctx context.Context) ([]db.APIKey, error)
+	GetServer(ctx context.Context, uuid string, userID *string) (*db.MCPServer, error)
+	ListAPIKeys(ctx context.Context, userID *string) ([]db.APIKey, error)
 	ListEndpoints(ctx context.Context) ([]db.Endpoint, error)
 	ListNamespaceServerMappings(ctx context.Context, namespaceUUID string) ([]db.NamespaceServerMapping, error)
-	ListNamespaces(ctx context.Context) ([]db.Namespace, error)
-	ListServers(ctx context.Context) ([]db.MCPServer, error)
+	ListNamespaces(ctx context.Context, userID *string) ([]db.Namespace, error)
+	ListServers(ctx context.Context, userID *string) ([]db.MCPServer, error)
 	SetAPIKeyActive(ctx context.Context, uuid string, active bool) error
 	SetServerMapping(ctx context.Context, namespaceUUID, serverUUID string, status db.ServerStatus) error
 	UpdateEndpoint(ctx context.Context, e *db.Endpoint) error
@@ -201,7 +203,9 @@ func (u *UI) handlePublicStats(w http.ResponseWriter, r *http.Request) {
 	u.statsMu.Unlock()
 
 	ctx := r.Context()
-	servers, err := u.db.ListServers(ctx)
+	// Public stats remain global (marketing truth on the landing page),
+	// not tenant-scoped.
+	servers, err := u.db.ListServers(ctx, nil)
 	if err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": "unavailable"})
 		return
@@ -250,6 +254,7 @@ type sessionStore struct {
 
 type session struct {
 	keyName string
+	userID  *string
 	expires time.Time
 }
 
@@ -257,14 +262,29 @@ func newSessionStore() *sessionStore {
 	return &sessionStore{sessions: make(map[string]session)}
 }
 
-func (s *sessionStore) create(keyName string) string {
+func (s *sessionStore) create(keyName string, userID *string) string {
 	b := make([]byte, 32)
 	_, _ = rand.Read(b)
 	token := hex.EncodeToString(b)
 	s.mu.Lock()
-	s.sessions[token] = session{keyName: keyName, expires: time.Now().Add(24 * time.Hour)}
+	s.sessions[token] = session{keyName: keyName, userID: userID, expires: time.Now().Add(24 * time.Hour)}
 	s.mu.Unlock()
 	return token
+}
+
+// lookup returns a session by token without mutating it.
+func (s *sessionStore) lookup(token string) (session, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	sess, ok := s.sessions[token]
+	if !ok {
+		return session{}, false
+	}
+	if time.Now().After(sess.expires) {
+		delete(s.sessions, token)
+		return session{}, false
+	}
+	return sess, true
 }
 
 func (s *sessionStore) valid(token string) bool {
@@ -303,6 +323,16 @@ func (s *sessionStore) sweep() {
 
 const sessionCookie = "submcp_session"
 
+// ctxKey is the request-context key for the authenticated user id.
+type ctxKey struct{}
+
+// sessUserID extracts the authenticated user id from the request context
+// (set by requireAuth). nil = legacy root (operator admin session).
+func sessUserID(r *http.Request) *string {
+	v, _ := r.Context().Value(ctxKey{}).(*string)
+	return v
+}
+
 func (u *UI) requireAuth(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		// P2-3: admin allowlist — check source IP before anything else.
@@ -315,7 +345,9 @@ func (u *UI) requireAuth(next http.HandlerFunc) http.HandlerFunc {
 			writeJSON(w, http.StatusUnauthorized, map[string]any{"error": "unauthorized"})
 			return
 		}
-		next(w, r)
+		sess, _ := u.sessions.lookup(c.Value)
+		ctx := context.WithValue(r.Context(), ctxKey{}, sess.userID)
+		next(w, r.WithContext(ctx))
 	}
 }
 
@@ -354,7 +386,7 @@ func (u *UI) handleLogin(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusForbidden, map[string]any{"error": "not_admin"})
 		return
 	}
-	token := u.sessions.create(key.Name)
+	token := u.sessions.create(key.Name, key.UserID)
 	http.SetCookie(w, &http.Cookie{
 		Name:     sessionCookie,
 		Value:    token,
@@ -395,12 +427,13 @@ func maskKey(k db.APIKey) db.APIKey {
 
 func (u *UI) handleOverview(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
-	servers, err := u.db.ListServers(ctx)
+	uid := sessUserID(r)
+	servers, err := u.db.ListServers(ctx, uid)
 	if err != nil {
 		writeInternalError(w, "list_servers", err)
 		return
 	}
-	namespaces, err := u.db.ListNamespaces(ctx)
+	namespaces, err := u.db.ListNamespaces(ctx, uid)
 	if err != nil {
 		writeInternalError(w, "list_namespaces", err)
 		return
@@ -410,7 +443,7 @@ func (u *UI) handleOverview(w http.ResponseWriter, r *http.Request) {
 		writeInternalError(w, "list_endpoints", err)
 		return
 	}
-	keys, err := u.db.ListAPIKeys(ctx)
+	keys, err := u.db.ListAPIKeys(ctx, uid)
 	if err != nil {
 		writeInternalError(w, "list_keys", err)
 		return
@@ -454,7 +487,7 @@ func (u *UI) handleOverview(w http.ResponseWriter, r *http.Request) {
 func (u *UI) handleServers(w http.ResponseWriter, r *http.Request) {
 	switch r.Method {
 	case http.MethodGet:
-		servers, err := u.db.ListServers(r.Context())
+		servers, err := u.db.ListServers(r.Context(), sessUserID(r))
 		if err != nil {
 			writeInternalError(w, "list_servers", err)
 			return
@@ -486,6 +519,9 @@ func (u *UI) handleServers(w http.ResponseWriter, r *http.Request) {
 		if s.Headers == nil {
 			s.Headers = json.RawMessage(`{}`)
 		}
+		// Tenant ownership stamp (SaaS Phase 1): creates belong to the
+		// authenticated user; legacy root sessions stay NULL.
+		s.UserID = sessUserID(r)
 		if err := u.db.CreateServer(r.Context(), &s); err != nil {
 			writeInternalError(w, "create_server", err)
 			return
@@ -518,7 +554,7 @@ func (u *UI) handleServerItem(w http.ResponseWriter, r *http.Request) {
 		// Merge with the existing row so NOT NULL columns (args, env,
 		// headers) never get NULLed when the SPA omits them (fix for
 		// the broken Edit-server path).
-		existing, err := u.db.GetServer(r.Context(), id)
+		existing, err := u.db.GetServer(r.Context(), id, sessUserID(r))
 		if err != nil || existing == nil {
 			writeJSON(w, http.StatusNotFound, map[string]any{"error": "server_not_found"})
 			return
@@ -551,7 +587,7 @@ func (u *UI) handleServerItem(w http.ResponseWriter, r *http.Request) {
 // handleServerTest performs a live initialize + tools/list against the
 // upstream to verify connectivity (used by the UI "Test" button).
 func (u *UI) handleServerTest(w http.ResponseWriter, r *http.Request, id string) {
-	srv, err := u.db.GetServer(r.Context(), id)
+	srv, err := u.db.GetServer(r.Context(), id, sessUserID(r))
 	if err != nil || srv == nil {
 		writeJSON(w, http.StatusNotFound, map[string]any{"error": "server_not_found"})
 		return
@@ -599,7 +635,7 @@ func deref(s *string) string {
 func (u *UI) handleNamespaces(w http.ResponseWriter, r *http.Request) {
 	switch r.Method {
 	case http.MethodGet:
-		ns, err := u.db.ListNamespaces(r.Context())
+		ns, err := u.db.ListNamespaces(r.Context(), sessUserID(r))
 		if err != nil {
 			writeInternalError(w, "list_namespaces", err)
 			return
@@ -615,6 +651,7 @@ func (u *UI) handleNamespaces(w http.ResponseWriter, r *http.Request) {
 			writeJSON(w, http.StatusBadRequest, map[string]any{"error": "name_required"})
 			return
 		}
+		n.UserID = sessUserID(r)
 		if err := u.db.CreateNamespace(r.Context(), &n); err != nil {
 			writeInternalError(w, "create_namespace", err)
 			return
@@ -689,6 +726,7 @@ func (u *UI) handleEndpoints(w http.ResponseWriter, r *http.Request) {
 			writeJSON(w, http.StatusBadRequest, map[string]any{"error": "invalid_endpoint_name"})
 			return
 		}
+		e.UserID = sessUserID(r)
 		if err := u.db.CreateEndpoint(r.Context(), &e); err != nil {
 			writeInternalError(w, "create_endpoint", err)
 			return
@@ -739,7 +777,7 @@ func (u *UI) handleEndpointItem(w http.ResponseWriter, r *http.Request) {
 func (u *UI) handleKeys(w http.ResponseWriter, r *http.Request) {
 	switch r.Method {
 	case http.MethodGet:
-		keys, err := u.db.ListAPIKeys(r.Context())
+		keys, err := u.db.ListAPIKeys(r.Context(), sessUserID(r))
 		if err != nil {
 			writeInternalError(w, "list_keys", err)
 			return
@@ -762,7 +800,7 @@ func (u *UI) handleKeys(w http.ResponseWriter, r *http.Request) {
 			_, _ = rand.Read(b)
 			key = "sk_mt_" + hex.EncodeToString(b)
 		}
-		k, err := u.db.CreateAPIKey(r.Context(), body.Name, key, body.Admin)
+		k, err := u.db.CreateAPIKey(r.Context(), body.Name, key, body.Admin, sessUserID(r))
 		if err != nil {
 			writeInternalError(w, "create_key", err)
 			return
