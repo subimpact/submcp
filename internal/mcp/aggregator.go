@@ -190,6 +190,12 @@ func (a *Aggregator) ListTools(ctx context.Context, namespaceUUID string) ([]Too
 		if srv.Type != db.ServerTypeStreamableHTTP && srv.Type != db.ServerTypeSSE {
 			continue // STDIO not supported in submcp v1
 		}
+		// Fix 9 companion: quarantined servers now stay in the fan-out
+		// list, so skip servers whose breaker is OPEN here - the
+		// half-open probe runs via getServerTools below.
+		if b := a.breaker(srv.UUID); b != nil && !b.Allow() {
+			continue
+		}
 		wg.Add(1)
 		go func(s db.MCPServer) {
 			defer wg.Done()
@@ -599,6 +605,13 @@ func prefixTools(serverName string, tools []Tool) []Tool {
 	for i, t := range tools {
 		out[i] = t
 		out[i].Name = ToolName(serverName, t.Name)
+		// Fix 8 (P1): deep-copy the annotations pointer - ListTools mutates
+		// it in place (Title=nil, overrides) and a shallow copy shares the
+		// 60s tool-cache entry (data race + cross-namespace poisoning).
+		if t.Annotations != nil {
+			c := *t.Annotations
+			out[i].Annotations = &c
+		}
 	}
 	return out
 }

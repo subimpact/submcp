@@ -19,6 +19,10 @@ type TenantStore interface {
 	Entitlement(ctx context.Context, t *db.Tenant) (*db.TenantEntitlement, error)
 	UsageToday(ctx context.Context, tenantID string) (int64, error)
 	BumpUsage(ctx context.Context, tenantID string) error
+	// TryBumpUsage atomically reserves one call against the daily cap
+	// (Fix 11: the old read-then-bump pattern let concurrent requests
+	// bypass the cap). Returns false when the cap is exhausted.
+	TryBumpUsage(ctx context.Context, tenantID string, cap int64) (bool, error)
 }
 
 // tenantGate enforces per-tenant entitlement + trial usage caps before MCP
@@ -54,8 +58,9 @@ func (g *tenantGate) checkEntitlement(w http.ResponseWriter, r *http.Request, t 
 	return true
 }
 
-// allowToolCall enforces the trial usage cap for tools/call.
-// Returns true when the call may proceed; false writes the 429.
+// allowToolCall enforces the trial usage cap for tools/call via an atomic
+// reservation (Fix 11). Returns true when the call may proceed; false
+// writes the 429.
 func (g *tenantGate) allowToolCall(w http.ResponseWriter, r *http.Request, t *db.Tenant) bool {
 	if g == nil || g.store == nil || t == nil || g.trialDailyCap <= 0 {
 		return true
@@ -64,13 +69,13 @@ func (g *tenantGate) allowToolCall(w http.ResponseWriter, r *http.Request, t *db
 	if t.Status != db.TenantTrialing {
 		return true
 	}
-	used, err := g.store.UsageToday(r.Context(), t.ID)
+	ok, err := g.store.TryBumpUsage(r.Context(), t.ID, g.trialDailyCap)
 	if err != nil {
 		// Fail-open on DB errors for usage accounting (availability over
 		// strictness); the entitlement gate already passed.
 		return true
 	}
-	if used >= g.trialDailyCap {
+	if !ok {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusTooManyRequests)
 		json.NewEncoder(w).Encode(map[string]any{
@@ -84,14 +89,9 @@ func (g *tenantGate) allowToolCall(w http.ResponseWriter, r *http.Request, t *db
 	return true
 }
 
-// bumpToolCall records a successful tool call against the tenant's daily
-// counter. Errors are ignored (usage accounting must never break a call).
-func (g *tenantGate) bumpToolCall(ctx context.Context, t *db.Tenant) {
-	if g == nil || g.store == nil || t == nil {
-		return
-	}
-	_ = g.store.BumpUsage(ctx, t.ID)
-}
+// bumpToolCall is now a no-op: allowToolCall already reserved the call
+// atomically (Fix 11). Kept so call sites stay stable.
+func (g *tenantGate) bumpToolCall(ctx context.Context, t *db.Tenant) {}
 
 // subdomainSlug extracts the tenant slug from a request Host.
 // Returns "" when the host is not a tenant subdomain (bare base host).

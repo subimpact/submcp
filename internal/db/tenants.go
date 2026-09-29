@@ -146,6 +146,36 @@ func (p *Pool) BumpUsage(ctx context.Context, tenantID string) error {
 	return err
 }
 
+// TryBumpUsage atomically reserves one call against the daily cap
+// (Fix 11: closes the read-then-bump TOCTOU). Returns true when the
+// reservation succeeded (call allowed), false when the cap is exhausted.
+func (p *Pool) TryBumpUsage(ctx context.Context, tenantID string, cap int64) (bool, error) {
+	// Fast path: row exists and is under cap.
+	tag, err := p.Exec(ctx, `
+		UPDATE usage_daily SET calls = calls + 1
+		WHERE tenant_id = $1 AND day = current_date AND calls < $2`,
+		tenantID, cap)
+	if err != nil {
+		return false, err
+	}
+	if tag.RowsAffected() > 0 {
+		return true, nil
+	}
+	// No row yet -> create one (idempotent); or row exists at cap -> deny.
+	tag, err = p.Exec(ctx, `
+		INSERT INTO usage_daily (tenant_id, day, calls) VALUES ($1, current_date, 1)
+		ON CONFLICT (tenant_id, day) DO NOTHING`,
+		tenantID)
+	if err != nil {
+		return false, err
+	}
+	if tag.RowsAffected() > 0 {
+		return true, nil
+	}
+	// Row existed but UPDATE matched 0 -> at or above cap.
+	return false, nil
+}
+
 // UsageToday returns the tenant's tool-call count for today (0 = none).
 func (p *Pool) UsageToday(ctx context.Context, tenantID string) (int64, error) {
 	var n int64

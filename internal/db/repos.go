@@ -85,13 +85,13 @@ type NamespaceServerMapping struct {
 
 // Tool is a row from tools.
 type Tool struct {
-	UUID         string          `json:"uuid"`
-	Name         string          `json:"name"`
-	Description  *string         `json:"description"`
-	ToolSchema   json.RawMessage `json:"tool_schema"`
-	CreatedAt    time.Time       `json:"created_at"`
-	UpdatedAt    time.Time       `json:"updated_at"`
-	MCPServerUUID string         `json:"mcp_server_uuid"`
+	UUID          string          `json:"uuid"`
+	Name          string          `json:"name"`
+	Description   *string         `json:"description"`
+	ToolSchema    json.RawMessage `json:"tool_schema"`
+	CreatedAt     time.Time       `json:"created_at"`
+	UpdatedAt     time.Time       `json:"updated_at"`
+	MCPServerUUID string          `json:"mcp_server_uuid"`
 }
 
 // NamespaceToolMapping is a row from namespace_tool_mappings.
@@ -161,10 +161,10 @@ func (p *Pool) GetEndpointByNameForUser(ctx context.Context, name, userID string
 }
 
 // GetNamespace returns a namespace by UUID.
-func (p *Pool) GetNamespace(ctx context.Context, uuid string) (*Namespace, error) {
+func (p *Pool) GetNamespace(ctx context.Context, uuid string, userID *string) (*Namespace, error) {
 	row := p.QueryRow(ctx, `
 		SELECT uuid, name, description, created_at, updated_at, user_id
-		FROM namespaces WHERE uuid = $1`, uuid)
+		FROM namespaces WHERE uuid = $1 AND ($2::text IS NULL OR user_id = $2)`, uuid, userID)
 	var n Namespace
 	err := row.Scan(&n.UUID, &n.Name, &n.Description, &n.CreatedAt, &n.UpdatedAt, &n.UserID)
 	if err == pgx.ErrNoRows {
@@ -176,8 +176,11 @@ func (p *Pool) GetNamespace(ctx context.Context, uuid string) (*Namespace, error
 	return &n, nil
 }
 
-// GetActiveServersForNamespace returns ACTIVE, non-quarantined servers
-// mapped to a namespace. Filters ACTIVE and error_status = NONE.
+// GetActiveServersForNamespace returns ACTIVE servers mapped to a
+// namespace. Fix 9 (P1): the error_status='NONE' filter is gone - it made
+// quarantine a PERMANENT lockout (the server left this list forever, so
+// the in-memory breaker's half-open probe could never run; recovery
+// required raw SQL). The circuit breaker is now the runtime gate.
 func (p *Pool) GetActiveServersForNamespace(ctx context.Context, namespaceUUID string) ([]MCPServer, error) {
 	rows, err := p.Query(ctx, `
 		SELECT s.uuid, s.name, s.description, s.type, s.command, s.args, s.env,
@@ -186,7 +189,6 @@ func (p *Pool) GetActiveServersForNamespace(ctx context.Context, namespaceUUID s
 		JOIN namespace_server_mappings m ON m.mcp_server_uuid = s.uuid
 		WHERE m.namespace_uuid = $1
 		  AND m.status = 'ACTIVE'
-		  AND s.error_status = 'NONE'
 		ORDER BY s.created_at ASC`, namespaceUUID)
 	if err != nil {
 		return nil, err
@@ -270,11 +272,12 @@ func (p *Pool) ValidateAPIKey(ctx context.Context, key string) (*APIKey, error) 
 
 // ListEndpoints returns all endpoints (used by the unauthenticated
 // enumeration route — kept for parity, see roadmap S4).
-func (p *Pool) ListEndpoints(ctx context.Context) ([]Endpoint, error) {
+func (p *Pool) ListEndpoints(ctx context.Context, userID *string) ([]Endpoint, error) {
 	rows, err := p.Query(ctx, `
 		SELECT uuid, name, description, namespace_uuid, enable_api_key_auth,
 		       use_query_param_auth, created_at, updated_at, user_id, enable_oauth
-		FROM endpoints ORDER BY name`)
+		FROM endpoints WHERE ($1::text IS NULL OR user_id = $1)
+		ORDER BY name`, userID)
 	if err != nil {
 		return nil, err
 	}
@@ -370,20 +373,20 @@ func (p *Pool) CreateServer(ctx context.Context, s *MCPServer) error {
 }
 
 // UpdateServer updates editable fields of a server.
-func (p *Pool) UpdateServer(ctx context.Context, s *MCPServer) error {
+func (p *Pool) UpdateServer(ctx context.Context, s *MCPServer, userID *string) error {
 	_, err := p.Exec(ctx, `
 		UPDATE mcp_servers SET name = $2, description = $3, type = $4,
 		       command = $5, args = $6, env = $7, url = $8, bearer_token = $9,
 		       headers = $10
-		WHERE uuid = $1`,
+		WHERE uuid = $1 AND ($11::text IS NULL OR user_id = $11)`,
 		s.UUID, s.Name, s.Description, s.Type, s.Command, s.Args, s.Env,
-		s.URL, s.BearerToken, s.Headers)
+		s.URL, s.BearerToken, s.Headers, userID)
 	return err
 }
 
 // DeleteServer removes a server and its mappings (cascade handles tools).
-func (p *Pool) DeleteServer(ctx context.Context, uuid string) error {
-	_, err := p.Exec(ctx, `DELETE FROM mcp_servers WHERE uuid = $1`, uuid)
+func (p *Pool) DeleteServer(ctx context.Context, uuid string, userID *string) error {
+	_, err := p.Exec(ctx, `DELETE FROM mcp_servers WHERE uuid = $1 AND ($2::text IS NULL OR user_id = $2)`, uuid, userID)
 	return err
 }
 
@@ -429,8 +432,8 @@ func (p *Pool) CreateNamespace(ctx context.Context, n *Namespace) error {
 }
 
 // DeleteNamespace removes a namespace (cascade removes mappings/endpoints).
-func (p *Pool) DeleteNamespace(ctx context.Context, uuid string) error {
-	_, err := p.Exec(ctx, `DELETE FROM namespaces WHERE uuid = $1`, uuid)
+func (p *Pool) DeleteNamespace(ctx context.Context, uuid string, userID *string) error {
+	_, err := p.Exec(ctx, `DELETE FROM namespaces WHERE uuid = $1 AND ($2::text IS NULL OR user_id = $2)`, uuid, userID)
 	return err
 }
 
@@ -510,8 +513,8 @@ func (p *Pool) CreateAPIKey(ctx context.Context, name, key string, isAdmin bool,
 }
 
 // SetAPIKeyActive toggles an API key's active state.
-func (p *Pool) SetAPIKeyActive(ctx context.Context, uuid string, active bool) error {
-	_, err := p.Exec(ctx, `UPDATE api_keys SET is_active = $2 WHERE uuid = $1`, uuid, active)
+func (p *Pool) SetAPIKeyActive(ctx context.Context, uuid string, active bool, userID *string) error {
+	_, err := p.Exec(ctx, `UPDATE api_keys SET is_active = $2 WHERE uuid = $1 AND ($3::text IS NULL OR user_id = $3)`, uuid, active, userID)
 	return err
 }
 
@@ -565,20 +568,20 @@ func (p *Pool) CreateEndpoint(ctx context.Context, e *Endpoint) error {
 }
 
 // UpdateEndpoint updates an endpoint.
-func (p *Pool) UpdateEndpoint(ctx context.Context, e *Endpoint) error {
+func (p *Pool) UpdateEndpoint(ctx context.Context, e *Endpoint, userID *string) error {
 	_, err := p.Exec(ctx, `
 		UPDATE endpoints SET name = $2, description = $3, namespace_uuid = $4,
 		       enable_api_key_auth = $5, use_query_param_auth = $6, enable_oauth = $7,
 		       updated_at = now()
-		WHERE uuid = $1`,
+		WHERE uuid = $1 AND ($8::text IS NULL OR user_id = $8)`,
 		e.UUID, e.Name, e.Description, e.NamespaceUUID, e.EnableAPIKeyAuth,
-		e.UseQueryParamAuth, e.EnableOAuth)
+		e.UseQueryParamAuth, e.EnableOAuth, userID)
 	return err
 }
 
 // DeleteEndpoint removes an endpoint.
-func (p *Pool) DeleteEndpoint(ctx context.Context, uuid string) error {
-	_, err := p.Exec(ctx, `DELETE FROM endpoints WHERE uuid = $1`, uuid)
+func (p *Pool) DeleteEndpoint(ctx context.Context, uuid string, userID *string) error {
+	_, err := p.Exec(ctx, `DELETE FROM endpoints WHERE uuid = $1 AND ($2::text IS NULL OR user_id = $2)`, uuid, userID)
 	return err
 }
 

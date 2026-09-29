@@ -1,6 +1,8 @@
 package mcp
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"expvar"
 	"fmt"
 	"net/http"
@@ -47,6 +49,9 @@ func NewMetrics(pool *Pool) *Metrics {
 }
 
 // RecordCall increments the call counter for an upstream.
+// Fix 5 (P0): expvar keys use a HASH of the server UUID and never expose
+// the server name - /metrics is unauthenticated and leaked every tenant's
+// server UUIDs + names. The uuid/name mapping lives in the admin UI only.
 func (m *Metrics) RecordCall(serverUUID, serverName string) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -58,9 +63,10 @@ func (m *Metrics) RecordCall(serverUUID, serverName string) {
 			state:    new(expvar.String),
 		}
 		m.upstream[serverUUID] = um
-		metricsRegistry.Set("upstream_"+serverUUID, expvar.Func(func() any {
+		sum := sha256.Sum256([]byte(serverUUID))
+		metricsKey := "upstream_" + hex.EncodeToString(sum[:6])
+		metricsRegistry.Set(metricsKey, expvar.Func(func() any {
 			return map[string]any{
-				"name":     serverName,
 				"calls":    um.calls.Value(),
 				"failures": um.failures.Value(),
 				"state":    um.state.Value(),

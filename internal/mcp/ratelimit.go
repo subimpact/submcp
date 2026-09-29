@@ -7,8 +7,8 @@ import (
 )
 
 // RateLimiter is a per-IP token bucket (P1-6 API rate limiting).
-// Defaults: 60 requests/min burst 60 (generous for MCP clients, stops
-// runaway loops and abuse).
+// Defaults: 60 requests/sec with burst 60 (generous for MCP clients,
+// stops runaway loops and abuse). NOTE: rate is tokens per SECOND.
 type RateLimiter struct {
 	mu       sync.Mutex
 	buckets  map[string]*bucket

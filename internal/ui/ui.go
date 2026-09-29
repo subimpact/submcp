@@ -32,19 +32,20 @@ type Store interface {
 	CreateEndpoint(ctx context.Context, e *db.Endpoint) error
 	CreateNamespace(ctx context.Context, n *db.Namespace) error
 	CreateServer(ctx context.Context, s *db.MCPServer) error
-	DeleteEndpoint(ctx context.Context, uuid string) error
-	DeleteNamespace(ctx context.Context, uuid string) error
-	DeleteServer(ctx context.Context, uuid string) error
+	DeleteEndpoint(ctx context.Context, uuid string, userID *string) error
+	DeleteNamespace(ctx context.Context, uuid string, userID *string) error
+	DeleteServer(ctx context.Context, uuid string, userID *string) error
+	GetNamespace(ctx context.Context, uuid string, userID *string) (*db.Namespace, error)
 	GetServer(ctx context.Context, uuid string, userID *string) (*db.MCPServer, error)
 	ListAPIKeys(ctx context.Context, userID *string) ([]db.APIKey, error)
-	ListEndpoints(ctx context.Context) ([]db.Endpoint, error)
+	ListEndpoints(ctx context.Context, userID *string) ([]db.Endpoint, error)
 	ListNamespaceServerMappings(ctx context.Context, namespaceUUID string) ([]db.NamespaceServerMapping, error)
 	ListNamespaces(ctx context.Context, userID *string) ([]db.Namespace, error)
 	ListServers(ctx context.Context, userID *string) ([]db.MCPServer, error)
-	SetAPIKeyActive(ctx context.Context, uuid string, active bool) error
+	SetAPIKeyActive(ctx context.Context, uuid string, active bool, userID *string) error
 	SetServerMapping(ctx context.Context, namespaceUUID, serverUUID string, status db.ServerStatus) error
-	UpdateEndpoint(ctx context.Context, e *db.Endpoint) error
-	UpdateServer(ctx context.Context, s *db.MCPServer) error
+	UpdateEndpoint(ctx context.Context, e *db.Endpoint, userID *string) error
+	UpdateServer(ctx context.Context, s *db.MCPServer, userID *string) error
 	ValidateAPIKey(ctx context.Context, key string) (*db.APIKey, error)
 }
 
@@ -438,7 +439,7 @@ func (u *UI) handleOverview(w http.ResponseWriter, r *http.Request) {
 		writeInternalError(w, "list_namespaces", err)
 		return
 	}
-	endpoints, err := u.db.ListEndpoints(ctx)
+	endpoints, err := u.db.ListEndpoints(ctx, sessUserID(r))
 	if err != nil {
 		writeInternalError(w, "list_endpoints", err)
 		return
@@ -568,13 +569,13 @@ func (u *UI) handleServerItem(w http.ResponseWriter, r *http.Request) {
 		if s.Headers == nil {
 			s.Headers = existing.Headers
 		}
-		if err := u.db.UpdateServer(r.Context(), &s); err != nil {
+		if err := u.db.UpdateServer(r.Context(), &s, sessUserID(r)); err != nil {
 			writeInternalError(w, "update_server", err)
 			return
 		}
 		writeJSON(w, http.StatusOK, map[string]any{"ok": true})
 	case http.MethodDelete:
-		if err := u.db.DeleteServer(r.Context(), id); err != nil {
+		if err := u.db.DeleteServer(r.Context(), id, sessUserID(r)); err != nil {
 			writeInternalError(w, "delete_server", err)
 			return
 		}
@@ -683,13 +684,26 @@ func (u *UI) handleNamespaceItem(w http.ResponseWriter, r *http.Request) {
 		if body.Status == "INACTIVE" {
 			status = db.ServerStatusInactive
 		}
+		// Fix 1 (P0): enforce tenant ownership on BOTH objects before
+		// mapping - otherwise Tenant A can map Tenant B's upstream and
+		// invoke it with B's credentials (cross-tenant credential theft).
+		ns, err := u.db.GetNamespace(r.Context(), id, sessUserID(r))
+		if err != nil || ns == nil {
+			writeJSON(w, http.StatusNotFound, map[string]any{"error": "namespace_not_found"})
+			return
+		}
+		srv, err := u.db.GetServer(r.Context(), body.ServerUUID, sessUserID(r))
+		if err != nil || srv == nil {
+			writeJSON(w, http.StatusNotFound, map[string]any{"error": "server_not_found"})
+			return
+		}
 		if err := u.db.SetServerMapping(r.Context(), id, body.ServerUUID, status); err != nil {
 			writeInternalError(w, "set_server_mapping", err)
 			return
 		}
 		writeJSON(w, http.StatusOK, map[string]any{"ok": true})
 	case http.MethodDelete:
-		if err := u.db.DeleteNamespace(r.Context(), id); err != nil {
+		if err := u.db.DeleteNamespace(r.Context(), id, sessUserID(r)); err != nil {
 			writeInternalError(w, "delete_namespace", err)
 			return
 		}
@@ -704,7 +718,7 @@ func (u *UI) handleNamespaceItem(w http.ResponseWriter, r *http.Request) {
 func (u *UI) handleEndpoints(w http.ResponseWriter, r *http.Request) {
 	switch r.Method {
 	case http.MethodGet:
-		eps, err := u.db.ListEndpoints(r.Context())
+		eps, err := u.db.ListEndpoints(r.Context(), sessUserID(r))
 		if err != nil {
 			writeInternalError(w, "list_endpoints", err)
 			return
@@ -727,6 +741,13 @@ func (u *UI) handleEndpoints(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		e.UserID = sessUserID(r)
+		// Fix 2 (P0): the endpoint's namespace must belong to the caller -
+		// otherwise a tenant can bind an endpoint to another tenant's
+		// namespace (and thus their tools).
+		if ns, err := u.db.GetNamespace(r.Context(), e.NamespaceUUID, sessUserID(r)); err != nil || ns == nil {
+			writeJSON(w, http.StatusBadRequest, map[string]any{"error": "namespace_not_found"})
+			return
+		}
 		if err := u.db.CreateEndpoint(r.Context(), &e); err != nil {
 			writeInternalError(w, "create_endpoint", err)
 			return
@@ -756,13 +777,13 @@ func (u *UI) handleEndpointItem(w http.ResponseWriter, r *http.Request) {
 			writeJSON(w, http.StatusBadRequest, map[string]any{"error": "invalid_endpoint_name"})
 			return
 		}
-		if err := u.db.UpdateEndpoint(r.Context(), &e); err != nil {
+		if err := u.db.UpdateEndpoint(r.Context(), &e, sessUserID(r)); err != nil {
 			writeInternalError(w, "update_endpoint", err)
 			return
 		}
 		writeJSON(w, http.StatusOK, map[string]any{"ok": true})
 	case http.MethodDelete:
-		if err := u.db.DeleteEndpoint(r.Context(), id); err != nil {
+		if err := u.db.DeleteEndpoint(r.Context(), id, sessUserID(r)); err != nil {
 			writeInternalError(w, "delete_endpoint", err)
 			return
 		}
@@ -800,7 +821,11 @@ func (u *UI) handleKeys(w http.ResponseWriter, r *http.Request) {
 			_, _ = rand.Read(b)
 			key = "sk_mt_" + hex.EncodeToString(b)
 		}
-		k, err := u.db.CreateAPIKey(r.Context(), body.Name, key, body.Admin, sessUserID(r))
+		// Fix 4 (P0): only the root operator session (nil userID) may mint
+		// admin keys. Tenant sessions always get isAdmin=false - otherwise
+		// any tenant escalates to full admin-plane access.
+		isAdmin := body.Admin && sessUserID(r) == nil
+		k, err := u.db.CreateAPIKey(r.Context(), body.Name, key, isAdmin, sessUserID(r))
 		if err != nil {
 			writeInternalError(w, "create_key", err)
 			return
@@ -826,7 +851,7 @@ func (u *UI) handleKeyItem(w http.ResponseWriter, r *http.Request) {
 			writeJSON(w, http.StatusBadRequest, map[string]any{"error": "active_required"})
 			return
 		}
-		if err := u.db.SetAPIKeyActive(r.Context(), id, *body.Active); err != nil {
+		if err := u.db.SetAPIKeyActive(r.Context(), id, *body.Active, sessUserID(r)); err != nil {
 			writeInternalError(w, "set_key_active", err)
 			return
 		}

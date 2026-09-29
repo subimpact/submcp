@@ -30,7 +30,7 @@ func (f *fakeDB) GetEndpointByNameForUser(_ context.Context, name, userID string
 	return nil, nil
 }
 
-func (f *fakeDB) ListEndpoints(_ context.Context) ([]db.Endpoint, error) {
+func (f *fakeDB) ListEndpoints(_ context.Context, _ *string) ([]db.Endpoint, error) {
 	var out []db.Endpoint
 	for _, e := range f.endpoints {
 		out = append(out, *e)

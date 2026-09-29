@@ -19,7 +19,7 @@ import (
 type EndpointStore interface {
 	GetEndpointByName(ctx context.Context, name string) (*db.Endpoint, error)
 	GetEndpointByNameForUser(ctx context.Context, name, userID string) (*db.Endpoint, error)
-	ListEndpoints(ctx context.Context) ([]db.Endpoint, error)
+	ListEndpoints(ctx context.Context, userID *string) ([]db.Endpoint, error)
 	Ping(ctx context.Context) error
 }
 
@@ -58,7 +58,7 @@ func NewServer(dbPool EndpointStore, agg *Aggregator, pool *Pool, auth *Auth, se
 		auth:      auth,
 		sessions:  NewSessionStore(sessionTTL),
 		startTime: time.Now(),
-		limiter:   NewRateLimiter(60, 60), // P1-6: 60 req/min per IP
+		limiter:   NewRateLimiter(60, 60), // P1-6: 60 req/sec, burst 60
 		sseChans:  make(map[string]chan json.RawMessage),
 	}
 }
@@ -297,8 +297,34 @@ func (s *Server) resolveTenantByOwner(r *http.Request, ep *db.Endpoint) (*db.Ten
 // handleEndpointList mirrors the original unauthenticated enumeration, but
 // strips sensitive fields (P1-17): user_id, namespace_uuid, and
 // enable_api_key_auth are NOT exposed to unauthenticated callers.
+// Fix 3 (P0): in tenant mode, list ONLY the resolved tenant's endpoints
+// (cross-tenant enumeration hole); legacy mode keeps the global listing.
 func (s *Server) handleEndpointList(w http.ResponseWriter, r *http.Request) {
-	eps, err := s.db.ListEndpoints(r.Context())
+	var scope *string
+	if s.tenants != nil {
+		slug := subdomainSlug(r.Host, s.tenants.baseHost)
+		var t *db.Tenant
+		var err error
+		if slug != "" {
+			t, err = s.tenants.store.GetTenantBySlug(r.Context(), slug)
+		} else {
+			t, err = s.tenants.store.GetTenantBySlug(r.Context(), operatorSlug)
+		}
+		if err != nil {
+			writeJSONError(w, http.StatusInternalServerError, "internal_error", "Database error")
+			return
+		}
+		if t != nil {
+			scope = &t.UserID
+		} else {
+			// Tenant mode on but no tenant resolves: show nothing rather
+			// than the global list.
+			w.Header().Set("Content-Type", "application/json")
+			json.NewEncoder(w).Encode(map[string]any{"endpoints": []any{}})
+			return
+		}
+	}
+	eps, err := s.db.ListEndpoints(r.Context(), scope)
 	if err != nil {
 		writeJSONError(w, http.StatusInternalServerError, "internal_error", "Database error")
 		return
@@ -351,10 +377,10 @@ func (s *Server) writeSessionNotFound(w http.ResponseWriter, sessionID string) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusNotFound)
 	json.NewEncoder(w).Encode(map[string]any{
-		"error":             "Session not found",
-		"message":           fmt.Sprintf("Transport not found for sessionId %s", sessionID),
+		"error":              "Session not found",
+		"message":            fmt.Sprintf("Transport not found for sessionId %s", sessionID),
 		"available_sessions": []string{},
-		"timestamp":         time.Now().UTC().Format("2006-01-02T15:04:05.000Z"),
+		"timestamp":          time.Now().UTC().Format("2006-01-02T15:04:05.000Z"),
 	})
 }
 
@@ -590,9 +616,17 @@ func (s *Server) handleSSE(w http.ResponseWriter, r *http.Request, ep *db.Endpoi
 	ctx := r.Context()
 	ticker := time.NewTicker(15 * time.Second)
 	defer ticker.Stop()
+	// Fix 10 (P1): cap legacy SSE streams at 24h like streamable-GET -
+	// without this a held connection leaks the goroutine + channel forever.
+	deadline := time.NewTimer(sseStreamCap)
+	defer deadline.Stop()
 	for {
 		select {
 		case <-ctx.Done():
+			s.sessions.Delete(sessionID)
+			s.pool.ReleaseSession(sessionID)
+			return
+		case <-deadline.C:
 			s.sessions.Delete(sessionID)
 			s.pool.ReleaseSession(sessionID)
 			return

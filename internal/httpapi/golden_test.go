@@ -41,7 +41,7 @@ func (f *fakeEndpointStore) GetEndpointByNameForUser(_ context.Context, name, us
 	}
 	return nil, nil
 }
-func (f *fakeEndpointStore) ListEndpoints(_ context.Context) ([]db.Endpoint, error) {
+func (f *fakeEndpointStore) ListEndpoints(_ context.Context, _ *string) ([]db.Endpoint, error) {
 	var out []db.Endpoint
 	for _, e := range f.endpoints {
 		out = append(out, *e)
@@ -93,28 +93,33 @@ func (f *fakeUIStore) CreateEndpoint(context.Context, *db.Endpoint) error { retu
 func (f *fakeUIStore) CreateNamespace(context.Context, *db.Namespace) error {
 	return nil
 }
-func (f *fakeUIStore) CreateServer(context.Context, *db.MCPServer) error { return nil }
-func (f *fakeUIStore) DeleteEndpoint(context.Context, string) error     { return nil }
-func (f *fakeUIStore) DeleteNamespace(context.Context, string) error    { return nil }
-func (f *fakeUIStore) DeleteServer(context.Context, string) error        { return nil }
+func (f *fakeUIStore) CreateServer(context.Context, *db.MCPServer) error      { return nil }
+func (f *fakeUIStore) DeleteEndpoint(context.Context, string, *string) error  { return nil }
+func (f *fakeUIStore) DeleteNamespace(context.Context, string, *string) error { return nil }
+func (f *fakeUIStore) DeleteServer(context.Context, string, *string) error    { return nil }
+func (f *fakeUIStore) GetNamespace(context.Context, string, *string) (*db.Namespace, error) {
+	return nil, nil
+}
 func (f *fakeUIStore) GetServer(context.Context, string, *string) (*db.MCPServer, error) {
 	return nil, nil
 }
 func (f *fakeUIStore) ListAPIKeys(context.Context, *string) ([]db.APIKey, error) { return nil, nil }
-func (f *fakeUIStore) ListEndpoints(context.Context) ([]db.Endpoint, error) {
+func (f *fakeUIStore) ListEndpoints(context.Context, *string) ([]db.Endpoint, error) {
 	return nil, nil
 }
 func (f *fakeUIStore) ListNamespaceServerMappings(context.Context, string) ([]db.NamespaceServerMapping, error) {
 	return nil, nil
 }
-func (f *fakeUIStore) ListNamespaces(context.Context, *string) ([]db.Namespace, error) { return nil, nil }
-func (f *fakeUIStore) ListServers(context.Context, *string) ([]db.MCPServer, error)    { return nil, nil }
-func (f *fakeUIStore) SetAPIKeyActive(context.Context, string, bool) error    { return nil }
+func (f *fakeUIStore) ListNamespaces(context.Context, *string) ([]db.Namespace, error) {
+	return nil, nil
+}
+func (f *fakeUIStore) ListServers(context.Context, *string) ([]db.MCPServer, error) { return nil, nil }
+func (f *fakeUIStore) SetAPIKeyActive(context.Context, string, bool, *string) error { return nil }
 func (f *fakeUIStore) SetServerMapping(context.Context, string, string, db.ServerStatus) error {
 	return nil
 }
-func (f *fakeUIStore) UpdateEndpoint(context.Context, *db.Endpoint) error { return nil }
-func (f *fakeUIStore) UpdateServer(context.Context, *db.MCPServer) error  { return nil }
+func (f *fakeUIStore) UpdateEndpoint(context.Context, *db.Endpoint, *string) error { return nil }
+func (f *fakeUIStore) UpdateServer(context.Context, *db.MCPServer, *string) error  { return nil }
 func (f *fakeUIStore) ValidateAPIKey(context.Context, string) (*db.APIKey, error) {
 	return nil, nil
 }

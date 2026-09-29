@@ -56,6 +56,15 @@ func (g *SSRFGuard) Check(rawURL string) error {
 	if ip.IsLoopback() {
 		return fmt.Errorf("upstream host %q is blocked (loopback)", host)
 	}
+	// Fix 6 (P1): 0.0.0.0 passes IsLoopback/IsPrivate/IsLinkLocal but
+	// connects to localhost on Linux. Block unspecified addresses and the
+	// whole 0.0.0.0/8 "this network" range outright.
+	if ip.IsUnspecified() {
+		return fmt.Errorf("upstream host %q is blocked (unspecified address)", host)
+	}
+	if v4 := ip.To4(); v4 != nil && v4[0] == 0 {
+		return fmt.Errorf("upstream host %q is blocked (0.0.0.0/8)", host)
+	}
 	if ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() {
 		return fmt.Errorf("upstream host %q is blocked (link-local)", host)
 	}

@@ -56,6 +56,13 @@ func (f *fakeTenantStore) BumpUsage(_ context.Context, tenantID string) error {
 	f.usage[tenantID]++
 	return nil
 }
+func (f *fakeTenantStore) TryBumpUsage(_ context.Context, tenantID string, cap int64) (bool, error) {
+	if f.usage[tenantID] >= cap {
+		return false, nil
+	}
+	f.usage[tenantID]++
+	return true, nil
+}
 
 func ten(id, userID, slug, status string, trialEnd time.Time) *db.Tenant {
 	t := &db.Tenant{ID: id, UserID: userID, Slug: slug, Status: db.TenantStatus(status), Plan: "pro"}
