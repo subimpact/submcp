@@ -204,13 +204,16 @@
     if (!prefersReduced) {
       requestAnimationFrame(render);
     } else {
-      // static single frame
+      // static single frame (reduced motion): same anchor->head rays,
+      // literal colors (canvas cannot parse CSS variables).
       ctx.lineWidth = 1;
-      ctx.strokeStyle = 'var(--line)';
-      segments.forEach(s => {
+      segments.forEach((s, i) => {
+        s.t = 1999; // park just before arrival (t=2000 would trigger reset)
+        s.update(0);
+        ctx.strokeStyle = i % 5 === 0 ? 'rgba(255,166,41,0.5)' : 'rgba(154,151,147,0.3)';
         ctx.beginPath();
-        ctx.moveTo(s.x, s.y);
-        ctx.lineTo(s.tx, s.ty);
+        ctx.moveTo(s.ax, s.ay);
+        ctx.lineTo(s.x, s.y);
         ctx.stroke();
       });
       ctx.fillStyle = '#ffa629';
