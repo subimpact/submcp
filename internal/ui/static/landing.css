@@ -303,10 +303,11 @@ p, span, .hero-sub, .stats-note, .section-sub, .price-note {
 
 /* ---------- Pricing ---------- */
 .pricing{padding:3rem 1.5rem;max-width:1400px;margin:auto;}
-.pricing-cards{display:flex;gap:2rem;} 
-.pricing-card{background:var(--bg-2);border:1px solid var(--line);border-radius:var(--radius-container);flex:1;padding:2rem;position:relative;} 
+.pricing-cards{display:flex;gap:2rem;margin-top:2.5rem;}
+.pricing-card{background:var(--bg-2);border:1px solid var(--line);border-radius:var(--radius-container);flex:1;padding:2rem;position:relative;}
 .pricing-card.featured{background:var(--bg-2);border-color:rgba(255,166,41,.4);transform:translateY(-2rem);} 
 .price-number{font-size:4rem;font-weight:700;color:var(--accent);}
+.price-number span{font-size:1.5rem;font-weight:400;color:var(--muted);}
 .price-period{font-weight:400;font-size:1.2rem;color:var(--muted);margin:0;}
 .price-note{font-size:.8rem;margin-top:.5rem;color:var(--muted);} 
 
@@ -327,6 +328,8 @@ footer .footer-inner a{color:var(--muted);}footer .footer-inner a:hover{color:va
   .hero-ctas{flex-direction:column;gap:.5rem;} 
   .nav-links{display:none;} 
   .nav-inner{flex-wrap:wrap;} 
+  .pricing-cards{flex-direction:column;gap:1.25rem;margin-top:1.5rem;}
+  .pricing-card.featured{transform:none;}
 }
 
 /* ---------- Reduced Motion ---------- */
