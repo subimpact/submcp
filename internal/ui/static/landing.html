@@ -1,196 +1,162 @@
 <!DOCTYPE html>
 <html lang="en">
 <head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>submcp - a lightweight MCP gateway</title>
-<meta name="description" content="submcp is a single-binary MCP gateway that aggregates multiple upstream MCP servers into one endpoint. 15 MB, Postgres-backed, embedded admin UI.">
-<link rel="stylesheet" href="/assets/landing.css">
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>submcp - an MCP gateway</title>
+  <meta name="description" content="submcp is a lightweight MCP gateway that aggregates multiple MCP servers into one endpoint. 15 MB, Postgres-backed, embedded admin UI.">
+  <link rel="stylesheet" href="/assets/landing.css">
 </head>
 <body>
-<header class="nav">
-  <div class="nav-inner">
-    <span class="brand">submcp</span>
-    <nav class="nav-links">
-      <a href="#features">Features</a>
-      <a href="#how">How it works</a>
-      <a href="#upstreams">Upstreams</a>
-      <a href="#pricing">Pricing</a>
-      <a href="#support">Support</a>
-    </nav>
-    <a class="btn btn-ghost" href="/admin/">Admin</a>
-  </div>
-</header>
-
-<main>
-  <section class="hero">
-    <div class="hero-copy">
-      <h1>One endpoint.<br>Every MCP server.</h1>
-      <p class="hero-sub">submcp aggregates multiple MCP servers into a single gateway. One binary, one URL, every tool.</p>
-      <div class="hero-ctas">
-        <a class="btn btn-primary" href="https://github.com/subimpact/submcp">View on GitHub</a>
-        <a class="btn btn-ghost" href="/admin/">Open admin</a>
-      </div>
+  <header class="nav">
+    <div class="nav-inner">
+      <span class="brand">submcp</span>
+      <nav class="nav-links">
+        <a href="#features">Features</a>
+        <a href="#how">How it works</a>
+        <a href="#upstreams">Upstreams</a>
+        <a href="#pricing">Pricing</a>
+        <a href="#support">Support</a>
+      </nav>
+      <a class="btn btn-ghost" href="/admin/">Admin</a>
     </div>
-    <div class="hero-stats" id="live-stats" aria-live="polite">
-      <div class="stat-block">
-        <div class="stat-num" id="stat-tools">-</div>
-        <div class="stat-label">tools exposed</div>
+  </header>
+
+  <main>
+    <section class="hero" role="banner" aria-label="Hero">
+      <div class="hero-left">
+        <h1>One endpoint.<br>Every MCP server.</h1>
+        <p class="hero-sub">submcp turns your scattered MCP servers into one gateway. One binary, one URL, every tool.</p>
+        <div class="hero-ctas">
+          <a class="btn btn-primary" href="https://app.subimpact.net/signup">Start free trial</a>
+          <a class="btn btn-ghost" href="https://github.com/subimpact/submcp">View on GitHub</a>
+        </div>
       </div>
-      <div class="stat-block">
-        <div class="stat-num" id="stat-servers">-</div>
-        <div class="stat-label">upstreams</div>
+      <div class="hero-right">
+        <canvas id="hero-canvas" aria-hidden="true"></canvas>
       </div>
-      <div class="stat-block">
-        <div class="stat-num">15 MB</div>
-        <div class="stat-label">single binary</div>
+    </section>
+
+    <section class="live-band" aria-label="Live stats">
+      <div class="stat-block"><div class="stat-num" id="stat-tools">-</div><div class="stat-label">tools exposed</div></div>
+      <div class="stat-block"><div class="stat-num" id="stat-servers">-</div><div class="stat-label">upstreams</div></div>
+      <div class="stat-block"><div class="stat-num">15 MB</div><div class="stat-label">single binary</div></div>
+      <div class="stat-block"><div class="stat-num" id="stat-uptime">-</div><div class="stat-label">uptime</div></div>
+      <p class="stats-note">LIVE FROM THIS GATEWAY</p>
+    </section>
+
+    <section class="marquee" aria-label="Tool list">
+      <div class="marquee-track">
+        peecai__list_projects / tavily-1__tavily_search / tavily-2__tavily_extract / tavily-3__tavily_crawl / semrush__keyword_research / semrush__organic_research / semrush__backlink_research / semrush__trends_research / apify__fetch_actor_details / apify__get_actor_run / apify__get_dataset_items / peecai__create_projects / peecai__get_brand_report / peecai__list_prompts / peecai__get_shopping_summary / semrush__url_research / semrush__tracking_research / tavily-1__tavily_research / apify__get_key_value_store_record / peecai__update_topics
       </div>
-      <div class="stat-block">
-        <div class="stat-num" id="stat-uptime">-</div>
-        <div class="stat-label">uptime</div>
+    </section>
+
+    <section class="features" id="features" aria-labelledby="features-title">
+      <h2 id="features-title">Features</h2>
+      <div class="feature-grid">
+        <div class="feature feature-wide">
+          <h3>One binary, no runtime</h3>
+          <p>A static Go binary with zero dependencies. No Node, no Python, no 1 GB container images. The Docker image is 15 MB.</p>
+        </div>
+        <div class="feature">
+          <h3>Multi-upstream fan-out</h3>
+          <p>One tools/list or tools/call fans out to every registered server. A dead upstream is skipped, the rest still respond.</p>
+        </div>
+        <div class="feature">
+          <h3>Namespaced tools</h3>
+          <p>Every tool is prefixed with its server. No collisions, no confusion across your stack.</p>
+        </div>
+        <div class="feature">
+          <h3>Both transports</h3>
+          <p>Streamable HTTP and legacy SSE served from the same process. Clients that speak either protocol just work.</p>
+        </div>
+        <div class="feature">
+          <h3>Postgres-backed config</h3>
+          <p>Endpoints, namespaces, servers, tool mappings and API keys live in Postgres. The database is the contract.</p>
+        </div>
+        <div class="feature feature-wide">
+          <h3>Embedded admin UI</h3>
+          <p>A full management interface ships inside the binary. Add servers, toggle namespace mappings, test connectivity, manage keys.</p>
+        </div>
       </div>
-      <p class="stats-note">Live from this gateway</p>
+    </section>
+
+    <section class="how" id="how" aria-labelledby="how-title">
+      <h2 id="how-title">From zero to gateway in three commands</h2>
+      <ol class="stacked-cards">
+        <li>
+          <span class="card-num">01</span>
+          <h3>Install</h3>
+          <pre>go build -o bin/submcp ./cmd/submcp, or pull the 15 MB Docker image.</pre>
+        </li>
+        <li>
+          <span class="card-num">02</span>
+          <h3>Configure</h3>
+          <p>Point it at Postgres, add your upstream servers in the admin UI, and test each one live.</p>
+        </li>
+        <li>
+          <span class="card-num">03</span>
+          <h3>Connect</h3>
+          <p>Point any MCP client at /metamcp/all/mcp with an API key. Every tool from every server, one URL.</p>
+        </li>
+      </ol>
+    </section>
+
+    <section class="upstreams" id="upstreams" aria-labelledby="upstreams-title">
+      <h2 id="upstreams-title">Live in production</h2>
+      <p class="section-sub">These upstreams are being aggregated by this gateway right now.</p>
+      <ul class="upstream-list" id="upstream-list">
+        <li>Loading live upstreams…</li>
+      </ul>
+    </section>
+
+    <section class="pricing" id="pricing" aria-labelledby="pricing-title">
+      <h2 id="pricing-title">Hosted, for when you don't want to run it</h2>
+      <p class="section-sub">Self-host for free, or use our hosted gateway: one URL, all your MCP servers, 14-day free trial.</p>
+      <div class="pricing-cards">
+        <div class="pricing-card">
+          <h3>SELF-HOSTED</h3>
+          <p class="price-number">$0</p>
+          <p class="price-period">forever · MIT</p>
+          <ul>
+            <li>The full gateway, run anywhere</li>
+            <li>Docker image or single binary</li>
+            <li>Community support</li>
+          </ul>
+          <a class="btn btn-ghost" href="https://github.com/subimpact/submcp">View on GitHub</a>
+        </div>
+        <div class="pricing-card featured">
+          <h3>HOSTED PRO</h3>
+          <p class="price-number">$12<span>/mo</span></p>
+          <p class="price-period">or $120/yr, 2 months free</p>
+          <ul>
+            <li>14-day free trial, card at signup</li>
+            <li>Your own subdomain endpoint</li>
+            <li>Unlimited servers and tools</li>
+            <li>Hosted and monitored 24/7</li>
+          </ul>
+          <a class="btn btn-primary" href="https://app.subimpact.net/signup">Start free trial</a>
+          <p class="price-note">No free tier after trial. Cancel anytime.</p>
+        </div>
+      </div>
+    </section>
+
+    <section class="support" id="support" aria-labelledby="support-title">
+      <h2 id="support-title">Keep the gateway running</h2>
+      <p class="section-sub">submcp is open source and free to self-host. If it saves you time, buy me a coffee.</p>
+      <a class="btn btn-primary" href="https://www.buymeacoffee.com/subimpact" target="_blank" rel="noopener">Buy me a coffee</a>
+    </section>
+  </main>
+
+  <footer>
+    <div class="footer-inner">
+      <span>submcp</span>
+      <a href="https://github.com/subimpact/submcp">GitHub</a>
+      <a href="/admin/">Admin</a>
+      <span class="footer-muted">MIT license</span>
     </div>
-  </section>
+  </footer>
 
-  <section class="features" id="features">
-    <h2>Built for the edge of the MCP ecosystem</h2>
-    <div class="feature-grid">
-      <div class="feature feature-wide">
-        <h3>One binary, no runtime</h3>
-        <p>A static Go binary with zero dependencies. No Node, no Python, no 1 GB container images. The Docker image is 15 MB.</p>
-      </div>
-      <div class="feature">
-        <h3>Multi-upstream fan-out</h3>
-        <p>One tools/list or tools/call fans out to every registered server. A dead upstream is skipped, the rest still respond.</p>
-      </div>
-      <div class="feature">
-        <h3>Namespaced tools</h3>
-        <p>Every tool is prefixed with its server: peecai__list_projects, tavily-1__tavily_search. No collisions, no confusion.</p>
-      </div>
-      <div class="feature">
-        <h3>Both transports</h3>
-        <p>Streamable HTTP and legacy SSE served from the same process. Clients that speak either protocol just work.</p>
-      </div>
-      <div class="feature">
-        <h3>Postgres-backed config</h3>
-        <p>Endpoints, namespaces, servers, tool mappings and API keys live in Postgres. The database is the contract.</p>
-      </div>
-      <div class="feature feature-wide">
-        <h3>Embedded admin UI</h3>
-        <p>A full management interface ships inside the binary. Add servers, toggle namespace mappings, test upstream connectivity, manage API keys. No separate frontend to deploy.</p>
-      </div>
-    </div>
-  </section>
-
-  <section class="how" id="how">
-    <h2>From zero to gateway in three commands</h2>
-    <ol class="steps">
-      <li>
-        <span class="step-num">1</span>
-        <h3>Install</h3>
-        <p>go build -o bin/submcp ./cmd/submcp, or pull the 15 MB Docker image.</p>
-      </li>
-      <li>
-        <span class="step-num">2</span>
-        <h3>Configure</h3>
-        <p>Point it at Postgres, add your upstream servers in the admin UI, and test each one live.</p>
-      </li>
-      <li>
-        <span class="step-num">3</span>
-        <h3>Connect</h3>
-        <p>Point any MCP client at /metamcp/all/mcp with an API key. Every tool from every server, one URL.</p>
-      </li>
-    </ol>
-  </section>
-
-  <section class="upstreams" id="upstreams">
-    <h2>Works with any MCP server</h2>
-    <p class="section-sub">This gateway is currently aggregating these upstreams in production.</p>
-    <ul class="upstream-list" id="upstream-list">
-      <li>Loading live upstreams...</li>
-    </ul>
-  </section>
-
-  <section class="pricing" id="pricing">
-    <h2>Hosted, for when you don't want to run it</h2>
-    <p class="section-sub">Self-host for free — or use our hosted gateway: one URL, all your MCP servers, 14-day free trial.</p>
-    <div class="pricing-cards">
-      <div class="price-card">
-        <h3>Self-hosted</h3>
-        <div class="price-num">$0</div>
-        <div class="price-period">forever · MIT</div>
-        <ul>
-          <li>The full gateway, run anywhere</li>
-          <li>Docker image or single binary</li>
-          <li>Community support</li>
-        </ul>
-        <a class="btn btn-ghost" href="https://github.com/subimpact/submcp">View on GitHub</a>
-      </div>
-      <div class="price-card price-card-featured">
-        <h3>Hosted Pro</h3>
-        <div class="price-num">$12<span>/mo</span></div>
-        <div class="price-period">or $120/yr — 2 months free</div>
-        <ul>
-          <li>14-day free trial, card at signup</li>
-          <li>Your own subdomain endpoint</li>
-          <li>Unlimited servers &amp; tools</li>
-          <li>Hosted &amp; monitored 24/7</li>
-        </ul>
-        <a class="btn btn-primary" href="https://app.subimpact.net/signup">Start free trial</a>
-      </div>
-    </div>
-  </section>
-
-  <section class="support" id="support">
-    <h2>Keep the gateway running</h2>
-    <p class="section-sub">submcp is open source and free to self-host. If it saves you time, buy me a coffee.</p>
-    <a class="btn btn-primary" href="https://www.buymeacoffee.com/subimpact" target="_blank" rel="noopener">Buy me a coffee</a>
-  </section>
-</main>
-
-<footer>
-  <div class="footer-inner">
-    <span>submcp</span>
-    <a href="https://github.com/subimpact/submcp">GitHub</a>
-    <a href="/admin/">Admin</a>
-    <span class="footer-muted">MIT license</span>
-  </div>
-</footer>
-
-<script>
-(async function () {
-  try {
-    var res = await fetch("/api/public/stats");
-    var d = await res.json();
-    document.getElementById("stat-tools").textContent = d.tools;
-    document.getElementById("stat-servers").textContent = d.servers;
-    document.getElementById("stat-uptime").textContent = d.uptime;
-    var list = document.getElementById("upstream-list");
-    list.innerHTML = "";
-    d.upstreams.forEach(function (s) {
-      var li = document.createElement("li");
-      var name = document.createElement("span");
-      name.className = "upstream-name";
-      name.textContent = s.name;
-      var type = document.createElement("span");
-      type.className = "upstream-type";
-      type.textContent = s.type;
-      var status = document.createElement("span");
-      status.className = "upstream-status " + (s.error_status === "NONE" ? "ok" : "err");
-      status.textContent = s.error_status === "NONE" ? "healthy" : "error";
-      li.appendChild(name);
-      li.appendChild(type);
-      li.appendChild(status);
-      list.appendChild(li);
-    });
-  } catch (e) {
-    document.getElementById("stat-tools").textContent = "?";
-    document.getElementById("stat-servers").textContent = "?";
-    document.getElementById("stat-uptime").textContent = "?";
-    document.getElementById("upstream-list").innerHTML = "<li>Stats unavailable</li>";
-  }
-})();
-</script>
+  <script src="/assets/landing.js"></script>
 </body>
 </html>
