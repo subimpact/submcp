@@ -330,6 +330,25 @@ footer .footer-inner a{color:var(--muted);}footer .footer-inner a:hover{color:va
   .nav-inner{flex-wrap:wrap;} 
   .pricing-cards{flex-direction:column;gap:1.25rem;margin-top:1.5rem;}
   .pricing-card.featured{transform:none;}
+  /* Bento: 12-col asymmetric grid does not fit 390px - stack to 1 column,
+     drop the heavy external photo cell (bandwidth + mid-word wrapping). */
+  .feature-grid{grid-template-columns:1fr;gap:1rem;}
+  .feature-grid .feature{grid-column:auto !important;}
+  .feature{padding:1.5rem;}
+  .feature-wide::before{display:none;}
+  .feature-wide{background:var(--bg-2);}
+  .feature:nth-child(4)::before{display:none;}
+  /* Upstream grid: mono stream-type tags cannot shrink - 1 column with
+     wrapping rows (2-col grid forced 264px min-content tracks = page
+     scrolled sideways to 712px). */
+  .upstream-list{grid-template-columns:1fr;}
+  .upstream-list li{flex-wrap:wrap;}
+  /* Live band: 4 KPIs in one row was clipped at 390px - 2x2 grid. */
+  .live-band{flex-wrap:wrap;gap:.25rem 0;}
+  .stat-block{flex:0 0 50%;box-sizing:border-box;}
+  .stats-note{flex-basis:100%;text-align:center;}
+  /* Safety net: nothing below may push the viewport sideways again. */
+  body{overflow-x:hidden;}
 }
 
 /* ---------- Reduced Motion ---------- */
