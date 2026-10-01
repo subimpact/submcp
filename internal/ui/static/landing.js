@@ -1,281 +1,341 @@
 // internal/ui/static/landing.js
-// Vanilla JS implementation for the submcp landing page
+// Vanilla JS for the submcp landing page.
+// No libraries, no scroll listeners. Everything honors prefers-reduced-motion.
 
 (() => {
   'use strict';
 
-  /* ---------- 1. Helpers ---------- */
-  const $ = selector => document.querySelector(selector);
-  const $$ = selector => Array.from(document.querySelectorAll(selector));
+  const $ = (sel) => document.querySelector(sel);
 
   const prefersReduced = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
 
-  /* ---------- 2. Fetch & render stats ---------- */
-  const fetchStats = async () => {
-    try {
-      const res = await fetch('/api/public/stats');
-      if (!res.ok) throw new Error('bad status');
-      const data = await res.json();
-
-      // live band stats
-      $('#stat-tools').textContent = data.tools;
-      $('#stat-servers').textContent = data.servers;
-      $('#stat-uptime').textContent = data.uptime;
-
-      // upstreams list
-      const ul = $('#upstream-list');
-      ul.innerHTML = '';
-      if (data.upstreams && data.upstreams.length) {
-        data.upstreams.forEach(u => {
-          const li = document.createElement('li');
-          const name = document.createTextNode(u.name + ' - ' + u.type); // dash replaced by hyphen, no characters banned
-          li.appendChild(name);
-
-          const status = document.createElement('span');
-          status.textContent = u.error_status === 'NONE' ? 'Healthy' : 'Error';
-          status.className = 'status ' + (u.error_status === 'NONE' ? 'ok' : 'err');
-          li.appendChild(document.createTextNode(' '));
-          li.appendChild(status);
-          ul.appendChild(li);
-        });
-      } else {
-        const li = document.createElement('li');
-        li.textContent = 'Stats unavailable';
-        ul.appendChild(li);
-      }
-    } catch (e) {
-      console.error('Stats fetch error', e);
-      $('#upstream-list').innerHTML = '';
+  /* ---------- 1. Live data: /api/public/stats ---------- */
+  const paintUpstreams = (upstreams) => {
+    const list = $('#upstream-list');
+    list.innerHTML = '';
+    if (!upstreams || !upstreams.length) {
       const li = document.createElement('li');
+      li.className = 'upstream-error';
       li.textContent = 'Stats unavailable';
-      $('#upstream-list').appendChild(li);
-    }
-  };
-  fetchStats();
-
-  /* ---------- 3. Count-up animation ---------- */
-  const countUp = (elem, to) => {
-    if (!Number.isFinite(to)) return; // placeholder text ("-") - leave as-is
-    if (prefersReduced) {
-      elem.textContent = to;
+      list.appendChild(li);
       return;
     }
-    const from = 0;
-    const duration = 400; // ms
-    const start = performance.now();
-    const animate = time => {
-      const elapsed = time - start;
-      const progress = Math.min(elapsed / duration, 1);
-      const eased = Math.pow(1 - progress, 3); // ease out cubic
-      const value = Math.round(from + (to - from) * (1 - eased));
-      elem.textContent = value;
-      if (progress < 1) {
-        requestAnimationFrame(animate);
-      }
-    };
-    requestAnimationFrame(animate);
+    upstreams.forEach((u) => {
+      const li = document.createElement('li');
+      li.className = 'upstream-row';
+
+      const name = document.createElement('span');
+      name.className = 'upstream-name';
+      name.textContent = u.name;
+
+      const type = document.createElement('span');
+      type.className = 'upstream-type';
+      type.textContent = u.type;
+
+      const status = document.createElement('span');
+      const healthy = u.error_status === 'NONE';
+      status.className = 'upstream-status ' + (healthy ? 'ok' : 'err');
+      status.textContent = healthy ? 'healthy' : 'error';
+
+      li.appendChild(name);
+      li.appendChild(type);
+      li.appendChild(status);
+      list.appendChild(li);
+    });
   };
 
-  const observerStats = new IntersectionObserver(entries => {
-    entries.forEach(entry => {
-      if (entry.isIntersecting) {
-        const target = entry.target;
-        const id = target.id;
-        // only animate when first visible
-        if (!target.dataset.cued) {
-          let value = 0;
-          if (id === 'stat-tools') value = parseInt(target.textContent, 10);
-          else if (id === 'stat-servers') value = parseInt(target.textContent, 10);
-          else if (id === 'stat-uptime') {
-            target.dataset.cued = ''; // skip, uptime is string
-            return;
-          }
-          countUp(target, value);
-          target.dataset.cued = '';
-        }
-      }
+  const paintStatsError = () => {
+    ['#stat-tools', '#stat-servers', '#stat-uptime'].forEach((sel) => {
+      const el = $(sel);
+      if (el) el.textContent = '?';
     });
-  }, { threshold: 0.5 });
-  $('#stat-tools').dataset.cued = ''; // sentinel
-  $('#stat-servers').dataset.cued = '';
-  $('#stat-uptime').dataset.cued = '';
-  ['#stat-tools', '#stat-servers', '#stat-uptime'].forEach(sel => {
-    const el = $(sel);
-    if (el) observerStats.observe(el);
-  });
+    const list = $('#upstream-list');
+    list.innerHTML = '';
+    const li = document.createElement('li');
+    li.className = 'upstream-error';
+    li.textContent = 'Stats unavailable';
+    list.appendChild(li);
+  };
 
-  /* ---------- 4. Hero canvas ---------- */
-  const canvas = $('#hero-canvas');
-  if (canvas && canvas.getContext) {
+  const loadStats = async () => {
+    try {
+      const res = await fetch('/api/public/stats');
+      if (!res.ok) throw new Error('bad status ' + res.status);
+      const d = await res.json();
+
+      const tools = $('#stat-tools');
+      const servers = $('#stat-servers');
+      const uptime = $('#stat-uptime');
+      if (!tools || !servers || !uptime) return;
+
+      // Numeric targets stored for the count-up; uptime renders as-is.
+      tools.dataset.target = String(d.tools);
+      servers.dataset.target = String(d.servers);
+      uptime.textContent = d.uptime;
+
+      if (prefersReduced) {
+        tools.textContent = String(d.tools);
+        servers.textContent = String(d.servers);
+        countUpDone();
+      }
+
+      // If the band was already scrolled into view before the fetch
+      // resolved, cue the count-up now.
+      const band = $('#live-band');
+      if (band && band.dataset.cued && !prefersReduced) {
+        ['#stat-tools', '#stat-servers'].forEach((sel) => {
+          const el = $(sel);
+          const to = parseInt(el.dataset.target, 10);
+          if (Number.isFinite(to)) countUp(el, to);
+        });
+      }
+
+      paintUpstreams(d.upstreams);
+    } catch (e) {
+      paintStatsError();
+    }
+  };
+
+  /* ---------- 2. Count-up (live band) ---------- */
+  const easeOut = (t) => 1 - Math.pow(1 - t, 3);
+
+  const countUp = (el, to) => {
+    const duration = 400;
+    const start = performance.now();
+    const tick = (now) => {
+      const p = Math.min((now - start) / duration, 1);
+      el.textContent = String(Math.round(to * easeOut(p)));
+      if (p < 1) requestAnimationFrame(tick);
+    };
+    requestAnimationFrame(tick);
+  };
+
+  const countUpDone = () => {
+    const el = $('#live-band');
+    if (!el) return;
+    ['#stat-tools', '#stat-servers'].forEach((sel) => {
+      const n = $(sel);
+      if (n && n.dataset.target) n.textContent = n.dataset.target;
+    });
+  };
+
+  const observeStats = () => {
+    const band = $('#live-band');
+    if (!band || band.dataset.cued) return;
+    band.dataset.cued = '1';
+    if (prefersReduced) {
+      countUpDone();
+      return;
+    }
+    ['#stat-tools', '#stat-servers'].forEach((sel) => {
+      const el = $(sel);
+      const to = parseInt(el.dataset.target, 10);
+      if (Number.isFinite(to)) countUp(el, to);
+    });
+    const uptime = $('#stat-uptime');
+    if (uptime && uptime.textContent === '') uptime.textContent = '-';
+  };
+
+  if ('IntersectionObserver' in window) {
+    const io = new IntersectionObserver((entries) => {
+      entries.forEach((entry) => {
+        if (entry.isIntersecting) {
+          observeStats();
+          io.disconnect();
+        }
+      });
+    }, { threshold: 0.4 });
+    const band = $('#live-band');
+    if (band) io.observe(band);
+  }
+
+  /* ---------- 3. Hero canvas: signal switchboard ---------- */
+  const initCanvas = () => {
+    const canvas = $('#hero-canvas');
+    if (!canvas || !canvas.getContext) return;
     const ctx = canvas.getContext('2d');
-    let width, height;
+
+    let width = 0;
+    let height = 0;
+    let raf = null;
+
+    const SEGMENTS = 40;
+    // Convergence node sits near center-right.
+    let node = { x: 0, y: 0 };
+
+    class Segment {
+      constructor() { this.reset(true); }
+      // A signal ray: the anchor stays on the top/right edge, the head
+      // travels toward the convergence node, so the drawn 1px segment
+      // grows as the signal arrives.
+      reset(seeded) {
+        const fromTop = Math.random() < 0.55;
+        if (fromTop) {
+          this.ax = Math.random() * width;
+          this.ay = -6;
+        } else {
+          this.ax = width + 6;
+          this.ay = Math.random() * height;
+        }
+        this.x = this.ax;
+        this.y = this.ay;
+        this.t = seeded && !prefersReduced ? Math.random() * 2600 : 0;
+        this.speed = 1800 + Math.random() * 1600;
+        this.amber = Math.random() < 0.22;
+      }
+      update(dt) {
+        this.t += dt;
+        const p = Math.min(this.t / this.speed, 1);
+        const ease = p * p * (3 - 2 * p); // smoothstep
+        this.x = this.ax + (node.x - this.ax) * ease;
+        this.y = this.ay + (node.y - this.ay) * ease;
+        if (p >= 1) this.reset(false);
+      }
+    }
+
+    const segments = Array.from({ length: SEGMENTS }, () => new Segment());
+
     const resize = () => {
       width = canvas.clientWidth;
       height = canvas.clientHeight;
       canvas.width = width;
       canvas.height = height;
+      node = { x: width * 0.72, y: height * 0.5 };
     };
-    window.addEventListener('resize', resize);
     resize();
+    window.addEventListener('resize', () => {
+      resize();
+      if (prefersReduced) drawStatic();
+    });
 
-    // Segment definition: a signal ray. The ANCHOR stays on the page
-    // edge and the head travels toward the convergence node, so the
-    // drawn line (anchor -> head) grows as the signal arrives.
-    class Segment {
-      constructor() {
-        this.reset();
-      }
-      reset() {
-        // anchor: random point on top or right edge
-        const fromTop = Math.random() < 0.5;
-        if (fromTop) {
-          this.ax = Math.random() * width;
-          this.ay = -10;
-        } else {
-          this.ax = width + 10;
-          this.ay = Math.random() * height;
-        }
-        this.x = this.ax;
-        this.y = this.ay;
-        this.tx = width * 0.75;
-        this.ty = height * 0.5;
-        // Stagger: random phase offset so rays sit at different lengths
-        // (synchronized segments read as a firework, staggered ones read
-        // as continuous signals arriving at a switchboard).
-        this.t = Math.random() * 2000;
-      }
-      update(dt) {
-        this.t += dt;
-        const progress = Math.min(this.t / 2000, 1);
-        const ease = progress * progress;
-        this.x = this.ax + (this.tx - this.ax) * ease;
-        this.y = this.ay + (this.ty - this.ay) * ease;
-        if (progress >= 1) this.reset();
-      }
-    }
+    const strokeFor = (s) =>
+      s.amber ? 'rgba(255,166,41,0.55)' : 'rgba(154,151,147,0.28)';
 
-    const segments = Array.from({ length: 48 }, () => new Segment());
-    let lastTime = null;
+    const pulse = (t) => 0.5 + 0.5 * Math.sin(t * (Math.PI / 1.2)); // 2.4s cycle
+
+    const drawNode = (t) => {
+      const a = pulse(t);
+      ctx.fillStyle = `rgba(255,166,41,${0.18 + 0.32 * a})`;
+      ctx.beginPath();
+      ctx.arc(node.x, node.y, 3 + 2 * a, 0, Math.PI * 2);
+      ctx.fill();
+    };
 
     const render = (now) => {
-      if (!lastTime) lastTime = now;
-      const dt = now - lastTime;
-      lastTime = now;
+      if (!canvas.__last) canvas.__last = now;
+      const dt = Math.min(now - canvas.__last, 50);
+      canvas.__last = now;
 
       ctx.clearRect(0, 0, width, height);
       ctx.lineWidth = 1;
-      segments.forEach((s, i) => {
+      segments.forEach((s) => {
         s.update(dt);
-        // canvas cannot parse CSS variables - use literal rgba strokes.
-        // Every 5th line is an amber signal, the rest are grey.
-        if (i % 5 === 0) {
-          ctx.strokeStyle = 'rgba(255,166,41,0.5)';
-        } else {
-          ctx.strokeStyle = 'rgba(154,151,147,0.3)';
-        }
+        ctx.strokeStyle = strokeFor(s);
         ctx.beginPath();
         ctx.moveTo(s.ax, s.ay);
         ctx.lineTo(s.x, s.y);
         ctx.stroke();
       });
-
-      // pulsing amber node with a soft halo
-      const time = now / 1000;
-      const alpha = 0.5 + 0.5 * Math.sin(time * 2.5);
-      const nx = width * 0.75;
-      const ny = height * 0.5;
-      const halo = ctx.createRadialGradient(nx, ny, 0, nx, ny, 28);
-      halo.addColorStop(0, `rgba(255,166,41,${0.28 * alpha})`);
-      halo.addColorStop(1, 'rgba(255,166,41,0)');
-      ctx.fillStyle = halo;
-      ctx.beginPath();
-      ctx.arc(nx, ny, 28, 0, Math.PI * 2);
-      ctx.fill();
-      ctx.fillStyle = `rgba(255,166,41,${alpha})`;
-      ctx.beginPath();
-      ctx.arc(nx, ny, 6, 0, Math.PI * 2);
-      ctx.fill();
-
-      if (!prefersReduced) {
-        requestAnimationFrame(render);
-      }
+      drawNode(now / 1000);
+      raf = requestAnimationFrame(render);
     };
 
-    if (!prefersReduced) {
-      requestAnimationFrame(render);
-    } else {
-      // static single frame (reduced motion): same anchor->head rays,
-      // literal colors (canvas cannot parse CSS variables).
+    const drawStatic = () => {
+      ctx.clearRect(0, 0, width, height);
       ctx.lineWidth = 1;
-      segments.forEach((s, i) => {
-        s.t = 1999; // park just before arrival (t=2000 would trigger reset)
+      segments.forEach((s) => {
+        s.t = s.speed; // park each ray just before arrival
         s.update(0);
-        ctx.strokeStyle = i % 5 === 0 ? 'rgba(255,166,41,0.5)' : 'rgba(154,151,147,0.3)';
+        ctx.strokeStyle = strokeFor(s);
         ctx.beginPath();
         ctx.moveTo(s.ax, s.ay);
         ctx.lineTo(s.x, s.y);
         ctx.stroke();
       });
-      ctx.fillStyle = '#ffa629';
+      ctx.fillStyle = 'rgba(255,166,41,0.85)';
       ctx.beginPath();
-      ctx.arc(width * 0.75, height * 0.5, 6, 0, Math.PI * 2);
+      ctx.arc(node.x, node.y, 4, 0, Math.PI * 2);
       ctx.fill();
+    };
+
+    if (prefersReduced) {
+      drawStatic();
+      return;
     }
 
-    // pause when hidden
+    raf = requestAnimationFrame(render);
+
+    // Pause the rAF loop when the tab is hidden.
     document.addEventListener('visibilitychange', () => {
       if (document.hidden) {
-        cancelAnimationFrame(render);
-      } else if (!prefersReduced) {
-        requestAnimationFrame(render);
+        if (raf) cancelAnimationFrame(raf);
+        raf = null;
+      } else if (raf === null) {
+        raf = requestAnimationFrame(render);
       }
     });
-  }
+  };
 
-  /* ---------- 5. Tool marquee ---------- */
-  const marquee = $('.marquee-track');
-  if (marquee) {
-    // Wrap the content in two identical spans: the -50% loop then lands
-    // exactly on the seam (raw text nodes would collapse into one flex
-    // item and the loop would jump mid-string).
-    const content = marquee.innerHTML;
-    marquee.innerHTML = `<span class="marquee-seq">${content}</span><span class="marquee-seq">${content}</span>`;
-  }
+  /* ---------- 4. Marquee: duplicate content for a seamless loop ---------- */
+  const initMarquee = () => {
+    const track = $('.marquee-track');
+    const seq = $('#marquee-seq');
+    if (!track || !seq) return;
+    const clone = seq.cloneNode(true);
+    clone.removeAttribute('id');
+    track.appendChild(clone);
+  };
 
-  /* ---------- 6. Scroll reveals ---------- */
-  const revealSections = ['.features', '.how', '.upstreams', '.pricing', '.support'];
-  const obsReveal = new IntersectionObserver(entries => {
-    entries.forEach(entry => {
-      if (entry.isIntersecting) {
-        entry.target.classList.add('visible');
-        obsReveal.unobserve(entry.target);
-      }
-    });
-  }, { threshold: 0.1 });
-  revealSections.forEach(sel => {
-    const el = $(sel);
-    if (el) obsReveal.observe(el);
-  });
-
-  /* ---------- 7. Sticky-stack fallback (scroll progress) ---------- */
-  if (!CSS.supports('animation-timeline', 'view()')) {
-    const cards = $$('.stacked-cards li');
-    const obsStack = new IntersectionObserver(entries => {
-      entries.forEach(entry => {
-        const idx = cards.indexOf(entry.target);
-        if (idx > 0) {
-          const prev = cards[idx - 1];
-          const ratio = entry.intersectionRatio;
-          if (ratio > 0.25) {
-            prev.style.transform = 'scale(0.96)';
-            prev.style.opacity = '0.5';
-          } else {
-            prev.style.transform = '';
-            prev.style.opacity = '';
-          }
+  /* ---------- 5. Scroll reveals ---------- */
+  const initReveals = () => {
+    const targets = document.querySelectorAll('.reveal');
+    if (!targets.length) return;
+    if (prefersReduced || !('IntersectionObserver' in window)) {
+      targets.forEach((el) => el.classList.add('in'));
+      return;
+    }
+    const io = new IntersectionObserver((entries) => {
+      entries.forEach((entry) => {
+        if (entry.isIntersecting) {
+          entry.target.classList.add('in');
+          io.unobserve(entry.target);
         }
       });
-    }, { threshold: [0, 0.25, 0.5, 0.75, 1] });
-    cards.forEach(c => obsStack.observe(c));
-  }
+    }, { threshold: 0.12 });
+    targets.forEach((el) => io.observe(el));
+  };
+
+  /* ---------- 6. Sticky-stack dim: JS fallback ---------- */
+  // Native scroll-scrub via animation-timeline: view() takes priority.
+  // Where it is unsupported, an IntersectionObserver dims the previous
+  // card as the next one scrolls over it. No scroll listeners, ever.
+  const initStack = () => {
+    if (prefersReduced) return;
+    const native = window.CSS && CSS.supports('animation-timeline', 'view()');
+    if (native) return;
+
+    const cards = Array.from(document.querySelectorAll('.stack-card'));
+    if (!cards.length || !('IntersectionObserver' in window)) return;
+
+    const io = new IntersectionObserver((entries) => {
+      entries.forEach((entry) => {
+        const idx = cards.indexOf(entry.target);
+        const prev = idx > 0 ? cards[idx - 1] : null;
+        if (!prev) return;
+        // The card approaching the sticky position dims the one beneath.
+        const past = entry.isIntersecting &&
+          entry.boundingClientRect.top < window.innerHeight * 0.14;
+        prev.classList.toggle('dimmed', past);
+      });
+    }, { threshold: [0, 0.2, 0.5], rootMargin: '-14% 0px 0px 0px' });
+
+    cards.forEach((c) => io.observe(c));
+  };
+
+  /* ---------- boot ---------- */
+  initCanvas();
+  initMarquee();
+  initReveals();
+  initStack();
+  loadStats();
 })();
