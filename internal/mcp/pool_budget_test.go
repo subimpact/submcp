@@ -10,46 +10,70 @@ import (
 
 func poolFactory() (*UpstreamClient, error) { return &UpstreamClient{}, nil }
 
-// PoC6: tenant tarpits must not take the whole pool. Eight tenants each try four
-// slow connections (the per-tenant cap). Only the tenant budget (30 of 100) may
-// be used, so an operator acquire still succeeds.
+// PoC6 (SaaS 4c, N2): tenant tarpits must not take the whole pool. Eight tenants
+// each try four slow connections. Each tenant is held to its share of three
+// (the per-tenant cap), so 24 of the 30 tenant units are used, the fourth
+// attempt of each tenant waits for a slot rather than taking another, and a
+// ninth tenant still gets a slot. Operator acquires keep their headroom.
 func TestPoC6_TenantBudgetLeavesOperatorHeadroom(t *testing.T) {
 	pool := NewPool(100, 20, time.Minute)
-	ctx := context.Background()
-	acquired, refused := 0, 0
+	bg := context.Background()
+	granted := 0
 	for tenant := 0; tenant < 8; tenant++ {
 		key := fmt.Sprintf("tenant-%d", tenant)
-		for i := 0; i < 4; i++ {
-			_, err := pool.AcquireTenant(ctx, fmt.Sprintf("sess-%d-%d", tenant, i),
-				fmt.Sprintf("srv-%d-%d#fp", tenant, i), key, poolFactory)
-			switch {
-			case err == nil:
-				acquired++
-			case errors.Is(err, errTenantBudgetFull):
-				refused++
-			default:
-				t.Fatalf("unexpected error: %v", err)
+		for i := 0; i < 3; i++ {
+			if _, err := pool.AcquireTenant(bg, fmt.Sprintf("sess-%d-%d", tenant, i),
+				fmt.Sprintf("srv-%d-%d#fp", tenant, i), key, poolFactory); err != nil {
+				t.Fatalf("tenant %d attempt %d within its share: %v", tenant, i, err)
 			}
+			granted++
+		}
+		short, cancel := context.WithTimeout(bg, 20*time.Millisecond)
+		_, err := pool.AcquireTenant(short, "sess-x", fmt.Sprintf("srv-%d-x#fp", tenant), key, poolFactory)
+		cancel()
+		if !errors.Is(err, context.DeadlineExceeded) {
+			t.Fatalf("tenant %d fourth acquire must wait for its share, got %v", tenant, err)
 		}
 	}
-	if acquired != 30 || refused != 2 {
-		t.Fatalf("tenant acquires: got %d granted and %d refused, want 30 and 2", acquired, refused)
+	if inUse, budget := pool.TenantStats(); inUse != granted || budget != 30 || granted != 24 {
+		t.Fatalf("tenant budget in use %d of %d (granted %d), want 24 of 30", inUse, budget, granted)
 	}
-	if inUse, budget := pool.TenantStats(); inUse != 30 || budget != 30 {
-		t.Fatalf("tenant budget %d of %d, want 30 of 30", inUse, budget)
+	if _, err := pool.AcquireTenant(bg, "sess-9", "srv-9#fp", "tenant-9", poolFactory); err != nil {
+		t.Fatalf("a ninth tenant must still get a slot while eight tenants are saturating: %v", err)
 	}
-	if _, err := pool.Acquire(ctx, "operator-session", "operator-legacy-server-uuid", poolFactory); err != nil {
-		t.Fatalf("operator acquire must succeed while the tenant budget is spent: %v", err)
+	if _, err := pool.Acquire(bg, "operator-session", "operator-legacy-server-uuid", poolFactory); err != nil {
+		t.Fatalf("operator acquire must succeed while the tenant budget is in use: %v", err)
 	}
 }
 
-// Per-tenant in-flight cap: the fifth concurrent acquire waits for a slot and
+// The tenant budget is still enforced across tenants: ten tenants at their share
+// use all 30 units, and an eleventh is refused at once (no wait).
+func TestTenantBudgetSpentRefusesFast(t *testing.T) {
+	pool := NewPool(100, 20, time.Minute)
+	bg := context.Background()
+	for tenant := 0; tenant < 10; tenant++ {
+		for i := 0; i < 3; i++ {
+			if _, err := pool.AcquireTenant(bg, "s", fmt.Sprintf("t%d-%d#fp", tenant, i), fmt.Sprintf("tenant-%d", tenant), poolFactory); err != nil {
+				t.Fatalf("tenant %d: %v", tenant, err)
+			}
+		}
+	}
+	start := time.Now()
+	if _, err := pool.AcquireTenant(bg, "s", "eleven#fp", "tenant-10", poolFactory); !errors.Is(err, errTenantBudgetFull) {
+		t.Fatalf("eleventh tenant with the budget spent: %v", err)
+	}
+	if el := time.Since(start); el > time.Second {
+		t.Fatalf("budget refusal must be immediate, took %s", el)
+	}
+}
+
+// Per-tenant in-flight cap: the fourth concurrent acquire waits for a slot and
 // gives up when its context ends. Releasing a slot lets the next one through.
 func TestTenantInFlightCapWaitsWithinContext(t *testing.T) {
 	pool := NewPool(100, 20, time.Minute)
 	bg := context.Background()
 	var held []*UpstreamClient
-	for i := 0; i < 4; i++ {
+	for i := 0; i < 3; i++ {
 		c, err := pool.AcquireTenant(bg, "s", fmt.Sprintf("srv-%d#fp", i), "tenant-a", poolFactory)
 		if err != nil {
 			t.Fatalf("acquire %d: %v", i, err)
@@ -60,7 +84,7 @@ func TestTenantInFlightCapWaitsWithinContext(t *testing.T) {
 	defer cancel()
 	_, err := pool.AcquireTenant(short, "s", "srv-4#fp", "tenant-a", poolFactory)
 	if !errors.Is(err, context.DeadlineExceeded) {
-		t.Fatalf("a fifth in-flight acquire must wait and then time out, got %v", err)
+		t.Fatalf("a fourth in-flight acquire must wait and then time out, got %v", err)
 	}
 	// Another tenant is not affected by tenant-a's cap.
 	if _, err := pool.AcquireTenant(bg, "s", "srv-other#fp", "tenant-b", poolFactory); err != nil {

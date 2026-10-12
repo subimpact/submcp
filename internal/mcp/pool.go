@@ -35,8 +35,12 @@ type Pool struct {
 	// active[downstreamSessionID][serverUUID] = stack of in-use clients
 	active map[string]map[string][]*pooledClient
 	// activePerServer[serverUUID] = total in-use connections to this server
-	// across ALL sessions (the real per-server cap)
+	// across ALL sessions (the real per-server cap). Zero entries are deleted,
+	// so the map holds only servers with something in use (SaaS 4c, N3).
 	activePerServer map[string]int
+	// activeTotal is the sum of activePerServer, kept as a running total so the
+	// pool cap check is O(1) rather than a scan of every server on each acquire.
+	activeTotal int
 	// lastUsed[serverUUID] = last time any idle client for this server was used
 	lastUsed map[string]time.Time
 
@@ -57,11 +61,13 @@ type pooledClient struct {
 	tenantKey string
 }
 
-// Default tenant budget: 30% of the total pool, and 4 in-flight acquires per
-// tenant. Operator headroom is the remaining 70% (at the default total of 100).
+// Default tenant budget: 30% of the total pool, and at most 3 connections in
+// use per tenant (SaaS 4c, N2). Eight tenants that each hold their share use 24
+// of the 30, so a ninth tenant still gets a slot. Operator headroom is the
+// remaining 70% (at the default total of 100).
 const (
 	tenantBudgetPercent = 30
-	tenantDefaultPerKey = 4
+	tenantDefaultPerKey = 3
 )
 
 // NewPool creates a connection pool.
@@ -133,23 +139,35 @@ func (p *Pool) AcquireTenant(ctx context.Context, sessionID, serverUUID, tenantK
 		return nil, fmt.Errorf("tenant upstream busy: %w", ctx.Err())
 	}
 
+	// SaaS 4c (N8): the budget unit and the in-flight slot are returned on every
+	// exit that does not hand a client out, including a panic in the factory.
+	granted := false
+	defer func() {
+		if !granted {
+			<-sem
+		}
+	}()
+
 	p.mu.Lock()
 	if p.tenantActive >= p.tenantBudget {
 		p.mu.Unlock()
-		<-sem
 		return nil, errTenantBudgetFull
 	}
 	p.tenantActive++
 	p.mu.Unlock()
+	defer func() {
+		if !granted {
+			p.mu.Lock()
+			p.tenantActive--
+			p.mu.Unlock()
+		}
+	}()
 
 	client, err := p.acquire(ctx, sessionID, serverUUID, factory, true, tenantKey)
 	if err != nil {
-		p.mu.Lock()
-		p.tenantActive--
-		p.mu.Unlock()
-		<-sem
 		return nil, err
 	}
+	granted = true
 	return client, nil
 }
 
@@ -178,17 +196,13 @@ func (p *Pool) acquire(ctx context.Context, sessionID, serverUUID string, factor
 		pc.tenant = tenant
 		pc.tenantKey = tenantKey
 		p.attachLocked(sessionID, serverUUID, pc)
-		p.activePerServer[serverUUID]++
+		p.incActiveLocked(serverUUID)
 		p.mu.Unlock()
 		return pc.client, nil
 	}
 
 	// Check caps (global per-server count, not per-session).
-	totalActive := 0
-	for _, n := range p.activePerServer {
-		totalActive += n
-	}
-	if totalActive >= p.maxTotal {
+	if p.activeTotal >= p.maxTotal {
 		p.mu.Unlock()
 		return nil, errPoolFull
 	}
@@ -200,26 +214,56 @@ func (p *Pool) acquire(ctx context.Context, sessionID, serverUUID string, factor
 	// Reserve the slot atomically while still holding the lock. The
 	// factory runs outside the lock, but the reservation is held so N
 	// concurrent acquires cannot all pass the cap check.
-	p.activePerServer[serverUUID]++
+	p.incActiveLocked(serverUUID)
 	p.mu.Unlock()
+
+	// Any exit that does not hand a client out (an error, or a panic in the
+	// factory) returns the reservation (SaaS 4c, N8).
+	handedOut := false
+	defer func() {
+		if !handedOut {
+			p.mu.Lock()
+			p.decActiveLocked(serverUUID, 1)
+			p.mu.Unlock()
+		}
+	}()
 
 	// Create new connection outside the lock.
 	client, err := factory()
 	if err != nil {
-		// Roll back the reservation.
-		p.mu.Lock()
-		p.activePerServer[serverUUID]--
-		if p.activePerServer[serverUUID] <= 0 {
-			delete(p.activePerServer, serverUUID)
-		}
-		p.mu.Unlock()
 		return nil, err
 	}
 
 	p.mu.Lock()
 	p.attachLocked(sessionID, serverUUID, &pooledClient{client: client, usedAt: time.Now(), tenant: tenant, tenantKey: tenantKey})
 	p.mu.Unlock()
+	handedOut = true
 	return client, nil
+}
+
+// incActiveLocked reserves one in-use connection for a server. The caller holds p.mu.
+func (p *Pool) incActiveLocked(serverUUID string) {
+	p.activePerServer[serverUUID]++
+	p.activeTotal++
+}
+
+// decActiveLocked returns n in-use connections for a server, deleting the entry
+// once it reaches zero so the map does not grow with every server ever used.
+// The caller holds p.mu.
+func (p *Pool) decActiveLocked(serverUUID string, n int) {
+	cur := p.activePerServer[serverUUID]
+	if n > cur {
+		n = cur
+	}
+	if n <= 0 {
+		return
+	}
+	if cur == n {
+		delete(p.activePerServer, serverUUID)
+	} else {
+		p.activePerServer[serverUUID] = cur - n
+	}
+	p.activeTotal -= n
 }
 
 func (p *Pool) attachLocked(sessionID, serverUUID string, pc *pooledClient) {
@@ -279,7 +323,7 @@ func (p *Pool) Release(sessionID, serverUUID string, client *UpstreamClient) {
 	if len(m) == 0 {
 		delete(p.active, sessionID)
 	}
-	p.activePerServer[serverUUID]--
+	p.decActiveLocked(serverUUID, 1)
 	p.releaseTenantLocked(pc)
 
 	// Return to idle if under cap.
@@ -319,7 +363,7 @@ func (p *Pool) ReleaseSession(sessionID string) {
 				toClose = append(toClose, pc.client)
 			}
 		}
-		p.activePerServer[serverUUID] -= len(stack)
+		p.decActiveLocked(serverUUID, len(stack))
 	}
 	p.mu.Unlock()
 
@@ -366,10 +410,7 @@ func (p *Pool) Stats() (idle, active int) {
 	for _, s := range p.idle {
 		idle += len(s)
 	}
-	for _, n := range p.activePerServer {
-		active += n
-	}
-	return
+	return idle, p.activeTotal
 }
 
 // TenantStats returns the tenant budget in use and its size.
