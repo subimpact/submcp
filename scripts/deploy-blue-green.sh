@@ -66,6 +66,21 @@ fi
 
 IMAGE="${1:-submcp:prod}"
 
+# Same-host upstreams that live on another compose network. A container that
+# is recreated without these networks cannot resolve the upstream (pitfall 15):
+# the matrix MCP server (matrix-mcp) lives on the Matrix stack network, and
+# dropping it cut 20 operator tools until it was reattached. Every deploy
+# attaches them to the new container, idempotently.
+UPSTREAM_NETWORKS=(urhxt3a4nix782v8eo5da1cb)
+attach_upstream_networks() {
+  local net
+  for net in "${UPSTREAM_NETWORKS[@]}"; do
+    if ! docker inspect -f '{{json .NetworkSettings.Networks}}' "$1" | grep -q "\"$net\""; then
+      docker network connect "$net" "$1" || echo "WARN: could not attach $1 to $net" >&2
+    fi
+  done
+}
+
 # --- Internal tenant network (SaaS phase 4b, #5) -----------------------------
 # submcp-internal is an --internal bridge: no route to the outside and no host
 # port. Only the gateway (both colours) and the SaaS attach to it. The gateway's
