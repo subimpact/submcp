@@ -30,6 +30,11 @@
 #
 # Dry run (no docker changes; prints the plan): DRY_RUN=1 ./scripts/deploy-blue-green.sh
 #
+# Networking detail: uy2 is attached at create with the default gateway priority;
+# every other network is attached with --gw-priority -1. Docker maps published
+# ports (127.0.0.1:12008, the Tailscale and Hermes path) through the gateway
+# network, so this keeps the mapping on the uy2 address the process listens on.
+#
 # Network exposure (SaaS 4c):
 #   - Each colour has a fixed address on the uy2 network (Traefik's network):
 #     prod 10.0.5.20, next 10.0.5.21. The process binds ONLY that address
@@ -109,7 +114,7 @@ attach_upstream_networks() {
   local net
   for net in "${UPSTREAM_NETWORKS[@]}"; do
     if ! docker inspect -f '{{json .NetworkSettings.Networks}}' "$1" 2>/dev/null | grep -q "\"$net\""; then
-      run_docker network connect "$net" "$1" || echo "WARN: could not attach $1 to $net" >&2
+      run_docker network connect --gw-priority -1 "$net" "$1" || echo "WARN: could not attach $1 to $net" >&2
     fi
   done
 }
@@ -275,8 +280,11 @@ create_gateway() {
     -e TENANT_API_INTERNAL_ADDR="${internalip}:12013" \
     "$@" \
     "$IMAGE" >/dev/null
-  run_docker network connect "$SHARED_NET" "$name"
-  run_docker network connect --ip "$internalip" --alias "$INTERNAL_ALIAS" "$INTERNAL_NET" "$name"
+  # Only uy2 provides the default gateway: Docker maps published ports through
+  # the gateway network, so without this the 127.0.0.1:<port> mapping would
+  # point at the shared address, where nothing listens (N11).
+  run_docker network connect --gw-priority -1 "$SHARED_NET" "$name"
+  run_docker network connect --gw-priority -1 --ip "$internalip" --alias "$INTERNAL_ALIAS" "$INTERNAL_NET" "$name"
   attach_upstream_networks "$name"
   run_docker start "$name" >/dev/null
 }
