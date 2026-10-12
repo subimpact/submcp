@@ -2,8 +2,10 @@ package main
 
 import (
 	"context"
+	"errors"
 	"log"
 	"log/slog"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
@@ -19,6 +21,30 @@ import (
 
 func main() {
 	cfg := config.Get()
+	// SaaS 4c (N6): all configuration is checked before anything is bound, so a
+	// bad key, address or network stops the start with one readable error.
+	if err := cfg.Validate(); err != nil {
+		log.Fatalf("config: %v", err)
+	}
+	var secretBox *mcp.SecretBox
+	if cfg.TenantSecretKey != "" {
+		box, err := mcp.NewSecretBox(cfg.TenantSecretKey)
+		if err != nil {
+			log.Fatalf("TENANT_SECRET_KEY: %v", err)
+		}
+		secretBox = box
+	}
+	// The internal tenant listener binds its address on submcp-internal. It is
+	// bound first, so a missing network stops the start before the database or
+	// the public listener is touched.
+	var internalLn net.Listener
+	if cfg.TenantAPIServiceToken != "" && cfg.TenantBaseHost != "" {
+		ln, err := net.Listen("tcp", cfg.TenantAPIInternalAddr)
+		if err != nil {
+			log.Fatalf("tenant API listener %s: %v (is submcp-internal attached with this address?)", cfg.TenantAPIInternalAddr, err)
+		}
+		internalLn = ln
+	}
 
 	// Structured logging (P1-14): slog with level from config.
 	var level slog.Level
@@ -57,6 +83,8 @@ func main() {
 	if err := mcp.SetTrustedProxies(cfg.TrustedProxyCIDRs); err != nil {
 		log.Fatalf("%v", err)
 	}
+	// SaaS 4c (N1): tenant subdomains are DNS-only, so CF-Connecting-IP is ignored there.
+	mcp.SetTenantBaseHost(cfg.TenantBaseHost)
 
 	// Wire the gateway.
 	pool := mcp.NewPool(cfg.MaxTotalConns, cfg.MaxConnsPerServer, 5*time.Minute)
@@ -67,16 +95,8 @@ func main() {
 	// per ALLOW_PRIVATE_UPSTREAMS (default ON self-hosted).
 	agg := mcp.NewAggregatorWithSSRF(pool, dbPool, mcp.NewSSRFGuard(cfg.AllowPrivateUpstreams))
 	// SaaS Phase 4: tenant upstreams use the strict network policy (public
-	// HTTPS only) and seal their credentials with TENANT_SECRET_KEY. A malformed
-	// key stops startup rather than storing or reading credentials under it.
-	var secretBox *mcp.SecretBox
-	if cfg.TenantSecretKey != "" {
-		box, err := mcp.NewSecretBox(cfg.TenantSecretKey)
-		if err != nil {
-			log.Fatalf("TENANT_SECRET_KEY: %v", err)
-		}
-		secretBox = box
-	}
+	// HTTPS only) and seal their credentials with TENANT_SECRET_KEY. The key was
+	// checked before any listener was bound (see above).
 	// SaaS phase 4b (#11): the gateway's own names are never tenant upstreams.
 	agg.SetTenantUpstreams(secretBox, mcp.NewTenantNetPolicy(cfg.TenantBaseHost))
 	// SaaS phase 4b (boot): tenant credentials sealed under the v1 AAD are
@@ -146,23 +166,23 @@ func main() {
 		ReadTimeout: 30 * time.Second,
 		IdleTimeout: 120 * time.Second,
 	}
-
+	// SaaS 4c (N6): listeners are bound here, and serve errors come back on
+	// serveErr. Nothing calls Fatalf from a goroutine.
+	publicLn, err := net.Listen("tcp", cfg.ListenAddr)
+	if err != nil {
+		log.Fatalf("listen %s: %v", cfg.ListenAddr, err)
+	}
+	serveErr := make(chan error, 2)
 	go func() {
 		log.Printf("submcp listening on %s", cfg.ListenAddr)
-		if err := httpServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-			log.Fatalf("listen: %v", err)
-		}
+		serveErr <- httpServer.Serve(publicLn)
 	}()
 
 	// SaaS Phase 4: service-only listener for the SaaS dashboard. It starts only
 	// with a service token, and it is never published to the host (see
 	// httpapi.BuildInternal and scripts/deploy-blue-green.sh).
 	var internalServer *http.Server
-	if cfg.TenantAPIServiceToken != "" && srv.TenantAPIEnabled() {
-		// SaaS phase 4b (#5): bind the internal docker network address only.
-		if err := config.ValidateInternalAddr(cfg.TenantAPIInternalAddr); err != nil {
-			log.Fatalf("%v", err)
-		}
+	if internalLn != nil {
 		internalServer = &http.Server{
 			Addr:              cfg.TenantAPIInternalAddr,
 			Handler:           httpapi.BuildInternal(logger, srv),
@@ -172,21 +192,30 @@ func main() {
 		}
 		go func() {
 			log.Printf("tenant API (service auth) listening on %s", cfg.TenantAPIInternalAddr)
-			if err := internalServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-				log.Fatalf("tenant api listen: %v", err)
-			}
+			serveErr <- internalServer.Serve(internalLn)
 		}()
 	}
 
-	// Graceful shutdown.
+	// Graceful shutdown. A listener that stops serving unexpectedly ends the
+	// process with a non-zero status, so the orchestrator restarts it.
 	stop := make(chan os.Signal, 1)
 	signal.Notify(stop, os.Interrupt, syscall.SIGTERM)
-	<-stop
+	var exitErr error
+	select {
+	case <-stop:
+	case err := <-serveErr:
+		if err != nil && !errors.Is(err, http.ErrServerClosed) {
+			exitErr = err
+		}
+	}
 	log.Println("shutting down...")
 	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer shutdownCancel()
 	_ = httpServer.Shutdown(shutdownCtx)
 	if internalServer != nil {
 		_ = internalServer.Shutdown(shutdownCtx)
+	}
+	if exitErr != nil {
+		log.Fatalf("listener stopped: %v", exitErr)
 	}
 }

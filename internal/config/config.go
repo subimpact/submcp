@@ -1,10 +1,14 @@
 package config
 
 import (
+	"encoding/base64"
+	"encoding/hex"
+	"errors"
 	"fmt"
 	"net"
 	"os"
 	"strconv"
+	"strings"
 	"time"
 )
 
@@ -64,8 +68,8 @@ type Config struct {
 	// TenantPoolBudget caps the upstream connections in use for tenants together
 	// (default 30% of MAX_TOTAL_CONNECTIONS), so operator acquires keep headroom.
 	TenantPoolBudget int
-	// TenantNamespaceInFlight caps concurrent tenant upstream acquires per
-	// tenant (default 4).
+	// TenantNamespaceInFlight caps the connections in use per tenant (its share
+	// of the budget; default 3, SaaS 4c N2).
 	TenantNamespaceInFlight int
 	// TrustedProxyCIDRs lists the proxies whose X-Forwarded-For and
 	// CF-Connecting-IP headers are believed (the Traefik network). Empty trusts
@@ -92,6 +96,83 @@ func ValidateInternalAddr(addr string) error {
 		return fmt.Errorf("TENANT_API_INTERNAL_ADDR %q must use an IP address", addr)
 	}
 	return nil
+}
+
+// Validate checks the whole configuration before any listener is bound (SaaS
+// 4c, N6). Every problem is reported in one error, so a single restart shows
+// them all. A value that is only read later (a bad key, a bad address) must
+// fail here, not in a goroutine after the public listener is already serving.
+func (c *Config) Validate() error {
+	var errs []error
+	if _, _, err := net.SplitHostPort(c.ListenAddr); err != nil {
+		errs = append(errs, fmt.Errorf("LISTEN_ADDR %q must be host:port", c.ListenAddr))
+	}
+	if err := ValidateCIDRList(c.TrustedProxyCIDRs); err != nil {
+		errs = append(errs, err)
+	}
+	if c.TenantSecretKey != "" && !ValidSecretKey(c.TenantSecretKey) {
+		errs = append(errs, errors.New("TENANT_SECRET_KEY must decode to exactly 32 bytes (openssl rand -base64 32)"))
+	}
+	if c.TenantBaseHost != "" && c.TenantSecretKey == "" {
+		errs = append(errs, errors.New("TENANT_SECRET_KEY is required when TENANT_BASE_HOST is set (tenant API enabled)"))
+	}
+	if c.TenantAPIServiceToken != "" {
+		if c.TenantBaseHost == "" {
+			errs = append(errs, errors.New("TENANT_API_SERVICE_TOKEN needs TENANT_BASE_HOST (the tenant API is off without it)"))
+		}
+		if len(c.TenantAPIServiceToken) < 32 {
+			errs = append(errs, errors.New("TENANT_API_SERVICE_TOKEN must be at least 32 characters (openssl rand -hex 32)"))
+		}
+		// The internal listener binds one address of submcp-internal. A missing
+		// or wildcard address is refused here, before anything is bound.
+		if err := ValidateInternalAddr(c.TenantAPIInternalAddr); err != nil {
+			errs = append(errs, fmt.Errorf("internal tenant listener: %w (is submcp-internal attached with its address?)", err))
+		}
+	}
+	for name, v := range map[string]int{
+		"MAX_TOTAL_CONNECTIONS": c.MaxTotalConns, "MAX_CONNECTIONS_PER_SERVER": c.MaxConnsPerServer,
+		"TENANT_MAX_SERVERS": c.TenantMaxServers, "TENANT_TEST_PER_MINUTE": c.TenantTestPerMinute,
+		"TENANT_POOL_BUDGET": c.TenantPoolBudget, "TENANT_NS_IN_FLIGHT": c.TenantNamespaceInFlight,
+	} {
+		if v < 1 {
+			errs = append(errs, fmt.Errorf("%s must be at least 1, got %d", name, v))
+		}
+	}
+	return errors.Join(errs...)
+}
+
+// ValidateCIDRList accepts a comma-separated list of IPs and CIDRs (empty is
+// valid and trusts nothing).
+func ValidateCIDRList(list string) error {
+	for _, part := range strings.Split(list, ",") {
+		part = strings.TrimSpace(part)
+		if part == "" {
+			continue
+		}
+		if strings.Contains(part, "/") {
+			if _, _, err := net.ParseCIDR(part); err != nil {
+				return fmt.Errorf("TRUSTED_PROXY_CIDRS: %q is not a valid CIDR", part)
+			}
+			continue
+		}
+		if net.ParseIP(part) == nil {
+			return fmt.Errorf("TRUSTED_PROXY_CIDRS: %q is not an IP or CIDR", part)
+		}
+	}
+	return nil
+}
+
+// ValidSecretKey reports whether key is 32 bytes as standard base64 or 64 hex
+// characters (the forms mcp.NewSecretBox accepts).
+func ValidSecretKey(key string) bool {
+	key = strings.TrimSpace(key)
+	if b, err := base64.StdEncoding.DecodeString(key); err == nil && len(b) == 32 {
+		return true
+	}
+	if h, err := hex.DecodeString(key); err == nil && len(h) == 32 {
+		return true
+	}
+	return false
 }
 
 func Get() *Config {
@@ -126,7 +207,7 @@ func Get() *Config {
 		TenantMaxServers:        getEnvInt("TENANT_MAX_SERVERS", 10),
 		TenantTestPerMinute:     getEnvInt("TENANT_TEST_PER_MINUTE", 10),
 		TenantPoolBudget:        getEnvInt("TENANT_POOL_BUDGET", 30),
-		TenantNamespaceInFlight: getEnvInt("TENANT_NS_IN_FLIGHT", 4),
+		TenantNamespaceInFlight: getEnvInt("TENANT_NS_IN_FLIGHT", 3),
 		TrustedProxyCIDRs:       getEnv("TRUSTED_PROXY_CIDRS", ""),
 	}
 }
