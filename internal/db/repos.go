@@ -48,6 +48,23 @@ type MCPServer struct {
 	UserID      *string         `json:"user_id"`
 	ErrorStatus ErrorStatus     `json:"error_status"`
 	Headers     json.RawMessage `json:"headers"`
+	// Phase 4 (tenant API). Not part of the admin JSON shape.
+	TenantManaged bool       `json:"-"`
+	LastError     *string    `json:"-"`
+	LastCheckedAt *time.Time `json:"-"`
+}
+
+// mcpServerCols is the column list every mcp_servers read uses, in the order
+// scanServerRow expects.
+const mcpServerCols = `uuid, name, description, type, command, args, env, url,
+	created_at, bearer_token, user_id, error_status, headers,
+	tenant_managed, last_error, last_checked_at`
+
+// scanServerRow scans one mcp_servers row selected with mcpServerCols.
+func scanServerRow(scan func(dest ...any) error, s *MCPServer) error {
+	return scan(&s.UUID, &s.Name, &s.Description, &s.Type, &s.Command,
+		&s.Args, &s.Env, &s.URL, &s.CreatedAt, &s.BearerToken, &s.UserID,
+		&s.ErrorStatus, &s.Headers, &s.TenantManaged, &s.LastError, &s.LastCheckedAt)
 }
 
 // Endpoint is a row from endpoints.
@@ -184,7 +201,8 @@ func (p *Pool) GetNamespace(ctx context.Context, uuid string, userID *string) (*
 func (p *Pool) GetActiveServersForNamespace(ctx context.Context, namespaceUUID string) ([]MCPServer, error) {
 	rows, err := p.Query(ctx, `
 		SELECT s.uuid, s.name, s.description, s.type, s.command, s.args, s.env,
-		       s.url, s.created_at, s.bearer_token, s.user_id, s.error_status, s.headers
+		       s.url, s.created_at, s.bearer_token, s.user_id, s.error_status, s.headers,
+		       s.tenant_managed, s.last_error, s.last_checked_at
 		FROM mcp_servers s
 		JOIN namespace_server_mappings m ON m.mcp_server_uuid = s.uuid
 		WHERE m.namespace_uuid = $1
@@ -198,9 +216,7 @@ func (p *Pool) GetActiveServersForNamespace(ctx context.Context, namespaceUUID s
 	var servers []MCPServer
 	for rows.Next() {
 		var s MCPServer
-		if err := rows.Scan(&s.UUID, &s.Name, &s.Description, &s.Type, &s.Command,
-			&s.Args, &s.Env, &s.URL, &s.CreatedAt, &s.BearerToken, &s.UserID,
-			&s.ErrorStatus, &s.Headers); err != nil {
+		if err := scanServerRow(rows.Scan, &s); err != nil {
 			return nil, err
 		}
 		servers = append(servers, s)
@@ -318,8 +334,7 @@ func (p *Pool) CountNamespaces(ctx context.Context) (int, error) {
 // operator deployment.
 func (p *Pool) ListServers(ctx context.Context, userID *string) ([]MCPServer, error) {
 	rows, err := p.Query(ctx, `
-		SELECT uuid, name, description, type, command, args, env, url,
-		       created_at, bearer_token, user_id, error_status, headers
+		SELECT `+mcpServerCols+`
 		FROM mcp_servers
 		WHERE ($1::text IS NULL OR user_id = $1)
 		ORDER BY created_at DESC`, userID)
@@ -331,9 +346,7 @@ func (p *Pool) ListServers(ctx context.Context, userID *string) ([]MCPServer, er
 	var out []MCPServer
 	for rows.Next() {
 		var s MCPServer
-		if err := rows.Scan(&s.UUID, &s.Name, &s.Description, &s.Type, &s.Command,
-			&s.Args, &s.Env, &s.URL, &s.CreatedAt, &s.BearerToken, &s.UserID,
-			&s.ErrorStatus, &s.Headers); err != nil {
+		if err := scanServerRow(rows.Scan, &s); err != nil {
 			return nil, err
 		}
 		out = append(out, s)
@@ -344,14 +357,11 @@ func (p *Pool) ListServers(ctx context.Context, userID *string) ([]MCPServer, er
 // GetServer returns one server by UUID, scoped to the owner (nil = legacy root view).
 func (p *Pool) GetServer(ctx context.Context, uuid string, userID *string) (*MCPServer, error) {
 	row := p.QueryRow(ctx, `
-		SELECT uuid, name, description, type, command, args, env, url,
-		       created_at, bearer_token, user_id, error_status, headers
+		SELECT `+mcpServerCols+`
 		FROM mcp_servers WHERE uuid = $1 AND ($2::text IS NULL OR user_id = $2)`,
 		uuid, userID)
 	var s MCPServer
-	err := row.Scan(&s.UUID, &s.Name, &s.Description, &s.Type, &s.Command,
-		&s.Args, &s.Env, &s.URL, &s.CreatedAt, &s.BearerToken, &s.UserID,
-		&s.ErrorStatus, &s.Headers)
+	err := scanServerRow(row.Scan, &s)
 	if err == pgx.ErrNoRows {
 		return nil, nil
 	}

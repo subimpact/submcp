@@ -41,6 +41,9 @@ type Server struct {
 	// SaaS Phase 1: tenant entitlement + usage caps. nil until enabled.
 	tenants *tenantGate
 
+	// SaaS Phase 4: tenant-managed upstreams API. nil until enabled.
+	tenantAPI *tenantAPI
+
 	// P0-1.11: legacy SSE response channels. handleSSEMessage delivers
 	// JSON-RPC responses over the open SSE stream (parity with the SDK's
 	// SSEServerTransport.handlePostMessage), not in the POST body.

@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"regexp"
@@ -67,6 +68,12 @@ type Aggregator struct {
 
 	// P1-3: SSRF guard (nil = disabled).
 	ssrf *SSRFGuard
+
+	// Phase 4: tenant-managed upstreams. tenantBox opens sealed header values;
+	// tenantPolicy is the strict network policy. Set once at startup via
+	// SetTenantUpstreams, before serving.
+	tenantBox    *SecretBox
+	tenantPolicy *TenantNetPolicy
 }
 
 const (
@@ -376,11 +383,27 @@ func (a *Aggregator) CallTool(ctx context.Context, namespaceUUID, sessionID, too
 		return nil, fmt.Errorf("server %q has no URL configured", target.Name)
 	}
 
-	// P1-3: SSRF guard on the call path too.
-	if a.ssrf != nil {
+	// Phase 4: a tenant tool disabled in this namespace is refused here too
+	// (tools/list already hides it). Operator servers keep their behaviour.
+	if target.TenantManaged && toolDisabled(mappings, target.UUID, dispatchName) {
+		denied := fmt.Sprintf("Access denied to tool %q: Tool has been disabled for this endpoint", toolName)
+		b, _ := json.Marshal(map[string]any{
+			"content": []map[string]any{{"type": "text", "text": denied}},
+			"isError": true,
+		})
+		return b, nil
+	}
+
+	// P1-3: SSRF guard on the call path too (operator servers). Tenant servers
+	// are checked by upstreamFor under the strict policy.
+	if !target.TenantManaged && a.ssrf != nil {
 		if err := a.ssrf.Check(*target.URL); err != nil {
 			return nil, fmt.Errorf("server %q: %w", target.Name, err)
 		}
+	}
+	cfg, poolKey, err := a.upstreamFor(*target)
+	if err != nil {
+		return nil, err
 	}
 
 	// P1-6: circuit breaker — fail fast when the upstream is down.
@@ -392,14 +415,7 @@ func (a *Aggregator) CallTool(ctx context.Context, namespaceUUID, sessionID, too
 	a.metrics.RecordCall(target.UUID, target.Name)
 	a.metrics.RecordState(target.UUID, b.State())
 
-	client, err := a.pool.Acquire(ctx, sessionID, target.UUID, func() (*UpstreamClient, error) {
-		cfg := UpstreamConfig{
-			Name:        target.Name,
-			URL:         *target.URL,
-			BearerToken: deref(target.BearerToken),
-			Headers:     parseHeaders(target.Headers),
-			Timeout:     60 * time.Second,
-		}
+	client, err := a.pool.Acquire(ctx, sessionID, poolKey, func() (*UpstreamClient, error) {
 		c := NewUpstreamClient(cfg)
 		if err := c.Connect(ctx); err != nil {
 			return nil, err
@@ -410,19 +426,25 @@ func (a *Aggregator) CallTool(ctx context.Context, namespaceUUID, sessionID, too
 		if b.Failure() {
 			a.quarantine(ctx, *target)
 		}
+		a.recordCheck(ctx, *target, cfg.Headers, err)
 		return nil, fmt.Errorf("acquire upstream %s: %w", target.Name, err)
 	}
-	defer a.pool.Release(sessionID, target.UUID, client)
+	defer a.pool.Release(sessionID, poolKey, client)
 
 	res, err := client.CallTool(ctx, dispatchName, args)
 	if err != nil {
 		if b.Failure() {
 			a.quarantine(ctx, *target)
 		}
-		return nil, err
+		a.recordCheck(ctx, *target, cfg.Headers, err)
+		return nil, redactError(err, secretsFor(*target, cfg))
 	}
 	b.Success()
 	a.unquarantine(ctx, *target)
+	if target.LastError != nil {
+		// Clear a stale failure only; successful calls are not written per call.
+		a.recordCheck(ctx, *target, cfg.Headers, nil)
+	}
 	return res, nil
 }
 
@@ -508,10 +530,14 @@ func (a *Aggregator) fetchServerTools(ctx context.Context, s db.MCPServer, overr
 	}
 	// P1-3: SSRF guard — block metadata/loopback always, RFC1918 unless
 	// allowPrivate (self-hosted n8n etc.).
-	if a.ssrf != nil {
+	if !s.TenantManaged && a.ssrf != nil {
 		if err := a.ssrf.Check(*s.URL); err != nil {
 			return nil, fmt.Errorf("server %q: %w", s.Name, err)
 		}
+	}
+	cfg, poolKey, err := a.upstreamFor(s)
+	if err != nil {
+		return nil, err
 	}
 	b := a.breaker(s.UUID)
 	if !b.Allow() {
@@ -522,14 +548,7 @@ func (a *Aggregator) fetchServerTools(ctx context.Context, s db.MCPServer, overr
 	a.metrics.RecordState(s.UUID, b.State())
 	// Use a per-call session id (pool handles reuse).
 	sessionID := "list-" + s.UUID
-	client, err := a.pool.Acquire(ctx, sessionID, s.UUID, func() (*UpstreamClient, error) {
-		cfg := UpstreamConfig{
-			Name:        s.Name,
-			URL:         *s.URL,
-			BearerToken: deref(s.BearerToken),
-			Headers:     parseHeaders(s.Headers),
-			Timeout:     60 * time.Second,
-		}
+	client, err := a.pool.Acquire(ctx, sessionID, poolKey, func() (*UpstreamClient, error) {
 		c := NewUpstreamClient(cfg)
 		if err := c.Connect(ctx); err != nil {
 			return nil, err
@@ -540,16 +559,18 @@ func (a *Aggregator) fetchServerTools(ctx context.Context, s db.MCPServer, overr
 		if b.Failure() {
 			a.quarantine(ctx, s)
 		}
-		return nil, err
+		a.recordCheck(ctx, s, cfg.Headers, err)
+		return nil, redactError(err, secretsFor(s, cfg))
 	}
-	defer a.pool.Release(sessionID, s.UUID, client)
+	defer a.pool.Release(sessionID, poolKey, client)
 
 	tools, err := client.ListTools(ctx)
 	if err != nil {
 		if b.Failure() {
 			a.quarantine(ctx, s)
 		}
-		return nil, err
+		a.recordCheck(ctx, s, cfg.Headers, err)
+		return nil, redactError(err, secretsFor(s, cfg))
 	}
 	b.Success()
 	a.unquarantine(ctx, s)
@@ -558,6 +579,7 @@ func (a *Aggregator) fetchServerTools(ctx context.Context, s db.MCPServer, overr
 	// original's proxy sync: only sync when the tool-name set changed,
 	// filter out override names, never fail the response on DB errors.
 	a.syncTools(ctx, s, tools, overrideNames)
+	a.recordCheck(ctx, s, cfg.Headers, nil)
 	return tools, nil
 }
 
@@ -744,6 +766,175 @@ func (a *Aggregator) getServers(ctx context.Context, namespaceUUID string) ([]db
 	a.caches[namespaceUUID] = &nsCache{servers: servers, at: time.Now()}
 	a.mu.Unlock()
 	return servers, nil
+}
+
+// SetTenantUpstreams wires the tenant credential box and strict network policy.
+// Call once at startup, before the aggregator serves requests.
+func (a *Aggregator) SetTenantUpstreams(box *SecretBox, policy *TenantNetPolicy) {
+	a.tenantBox = box
+	a.tenantPolicy = policy
+}
+
+// tenantUpstreamTimeout bounds one tenant upstream request (connect plus body).
+const tenantUpstreamTimeout = 20 * time.Second
+
+// upstreamFor builds the connection config for a server and the key its pooled
+// connections are reused under. Operator servers get exactly the legacy config
+// (plaintext headers, pool key = server UUID). Tenant servers get the strict
+// policy, their decrypted headers, and a pool key that includes a fingerprint
+// of URL and headers, so an updated server never reuses a connection made with
+// the old settings.
+func (a *Aggregator) upstreamFor(s db.MCPServer) (UpstreamConfig, string, error) {
+	if s.URL == nil || *s.URL == "" {
+		return UpstreamConfig{}, "", fmt.Errorf("server %q has no URL configured", s.Name)
+	}
+	if !s.TenantManaged {
+		return UpstreamConfig{
+			Name:        s.Name,
+			URL:         *s.URL,
+			BearerToken: deref(s.BearerToken),
+			Headers:     parseHeaders(s.Headers),
+			Timeout:     60 * time.Second,
+		}, s.UUID, nil
+	}
+	if s.Type != db.ServerTypeStreamableHTTP && s.Type != db.ServerTypeSSE {
+		return UpstreamConfig{}, "", fmt.Errorf("server %q: type %s is not available to tenant servers", s.Name, s.Type)
+	}
+	if a.tenantPolicy == nil {
+		return UpstreamConfig{}, "", errors.New("tenant upstreams are not configured")
+	}
+	if _, err := ValidateTenantURL(*s.URL, a.tenantPolicy); err != nil {
+		return UpstreamConfig{}, "", fmt.Errorf("server %q: %w", s.Name, err)
+	}
+	headers, err := OpenSealedHeaders(s.Headers, a.tenantBox)
+	if err != nil {
+		return UpstreamConfig{}, "", fmt.Errorf("server %q: %w", s.Name, err)
+	}
+	cfg := UpstreamConfig{
+		Name:    s.Name,
+		URL:     *s.URL,
+		Headers: headers,
+		Timeout: tenantUpstreamTimeout,
+		Policy:  a.tenantPolicy,
+	}
+	return cfg, s.UUID + "#" + upstreamFingerprint(*s.URL, headers), nil
+}
+
+// upstreamFingerprint is a short digest of a tenant server's URL and headers,
+// used only to key pooled connections (never shown or stored).
+func upstreamFingerprint(url string, headers map[string]string) string {
+	keys := make([]string, 0, len(headers))
+	for k := range headers {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	h := sha256.New()
+	h.Write([]byte(url))
+	for _, k := range keys {
+		h.Write([]byte{0})
+		h.Write([]byte(k))
+		h.Write([]byte{0})
+		h.Write([]byte(headers[k]))
+	}
+	return hex.EncodeToString(h.Sum(nil)[:8])
+}
+
+// secretsFor returns the header values that must be redacted from errors about
+// this server: the tenant's credentials only. Operator servers return nil, so
+// their error text is unchanged.
+func secretsFor(s db.MCPServer, cfg UpstreamConfig) map[string]string {
+	if !s.TenantManaged {
+		return nil
+	}
+	return cfg.Headers
+}
+
+// redactError removes credential values from an error before it is stored or
+// returned to a tenant. Nil headers mean nothing is changed.
+func redactError(err error, headers map[string]string) error {
+	if err == nil || len(headers) == 0 {
+		return err
+	}
+	return errors.New(redactSecrets(err.Error(), headers))
+}
+
+// recordCheck stores the outcome of the latest test or fetch on a tenant
+// server (last_error, last_checked_at). Best effort: a failed write is logged,
+// never returned to the caller. Operator servers are not written.
+func (a *Aggregator) recordCheck(ctx context.Context, s db.MCPServer, headers map[string]string, err error) {
+	if !s.TenantManaged {
+		return
+	}
+	cs, ok := a.db.(serverCheckStore)
+	if !ok {
+		return
+	}
+	var msg *string
+	if err != nil {
+		m := truncate(redactSecrets(err.Error(), headers), 500)
+		msg = &m
+	}
+	if werr := cs.SetServerCheck(ctx, s.UUID, msg); werr != nil {
+		slog.Warn("tenant server check write failed", "server", s.Name, "err", werr)
+	}
+}
+
+// serverCheckStore is the optional store capability behind recordCheck.
+type serverCheckStore interface {
+	SetServerCheck(ctx context.Context, uuid string, lastError *string) error
+}
+
+// RefreshServer runs a fresh connect and tools/list for one server, stores the
+// tools, records the outcome, and primes the tool cache so the next tools/list
+// reflects the result. It returns how many tools were discovered.
+func (a *Aggregator) RefreshServer(ctx context.Context, s db.MCPServer) (int, error) {
+	tools, err := a.fetchServerTools(ctx, s, nil)
+	if err != nil {
+		return 0, err
+	}
+	a.toolMu.Lock()
+	a.toolCache[s.UUID] = &toolCacheEntry{tools: tools, at: time.Now()}
+	a.toolMu.Unlock()
+	return len(tools), nil
+}
+
+// ForgetServer drops every in-memory trace of a server (tool cache, sync hash,
+// breaker) after it was updated or deleted.
+func (a *Aggregator) ForgetServer(serverUUID string) {
+	a.toolMu.Lock()
+	delete(a.toolCache, serverUUID)
+	a.toolMu.Unlock()
+	a.syncMu.Lock()
+	delete(a.syncHashes, serverUUID)
+	delete(a.breakers, serverUUID)
+	a.syncMu.Unlock()
+}
+
+// InvalidateNamespace drops the cached server list and route map for a
+// namespace, so a server added or removed there is visible at once rather
+// than after the 5-second cache TTL.
+func (a *Aggregator) InvalidateNamespace(namespaceUUID string) {
+	a.mu.Lock()
+	delete(a.caches, namespaceUUID)
+	a.mu.Unlock()
+	a.routeMu.Lock()
+	delete(a.routes, namespaceUUID)
+	a.routeMu.Unlock()
+}
+
+// toolDisabled reports whether a tool is switched off (INACTIVE mapping) for a
+// server in the namespace of the current call.
+func toolDisabled(mappings []struct {
+	Mapping db.NamespaceToolMapping
+	Tool    db.Tool
+}, serverUUID, toolName string) bool {
+	for _, m := range mappings {
+		if m.Mapping.MCPServerUUID == serverUUID && m.Tool.Name == toolName &&
+			m.Mapping.Status == db.ServerStatusInactive {
+			return true
+		}
+	}
+	return false
 }
 
 func deref(s *string) string {

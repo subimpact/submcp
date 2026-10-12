@@ -25,6 +25,7 @@ type UpstreamClient struct {
 	url        string
 	authHeader string // "Bearer <token>" or ""
 	extraHdrs  map[string]string
+	strict     bool // tenant-managed upstream (phase 4)
 
 	httpClient *http.Client
 
@@ -35,11 +36,15 @@ type UpstreamClient struct {
 
 // UpstreamConfig describes how to reach one upstream.
 type UpstreamConfig struct {
-	Name       string
-	URL        string
+	Name        string
+	URL         string
 	BearerToken string
-	Headers    map[string]string
-	Timeout    time.Duration
+	Headers     map[string]string
+	Timeout     time.Duration
+	// Policy, when set, makes this a tenant-managed upstream: the policy dialer
+	// is used, redirects are refused, and the response body is capped. Nil keeps
+	// the operator behaviour exactly.
+	Policy *TenantNetPolicy
 }
 
 // NewUpstreamClient creates a client for a STREAMABLE_HTTP upstream.
@@ -47,6 +52,20 @@ func NewUpstreamClient(cfg UpstreamConfig) *UpstreamClient {
 	auth := ""
 	if cfg.BearerToken != "" {
 		auth = "Bearer " + cfg.BearerToken
+	}
+	if cfg.Policy != nil {
+		return &UpstreamClient{
+			serverName: cfg.Name,
+			url:        cfg.URL,
+			authHeader: auth,
+			extraHdrs:  cfg.Headers,
+			strict:     true,
+			httpClient: &http.Client{
+				Timeout:       cfg.Timeout,
+				Transport:     cfg.Policy.transport(),
+				CheckRedirect: refuseRedirects,
+			},
+		}
 	}
 	// P2-14 transport tuning: the default transport caps idle conns per
 	// host at 2, which throttles a gateway fanning out to many upstreams.
@@ -104,7 +123,7 @@ func (c *UpstreamClient) Connect(ctx context.Context) error {
 
 	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusAccepted {
 		raw, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
-		return fmt.Errorf("initialize %s: HTTP %d: %s", c.serverName, resp.StatusCode, truncate(string(raw), 300))
+		return c.statusError("initialize", resp.StatusCode, raw)
 	}
 
 	// Capture session id if present.
@@ -177,7 +196,7 @@ func (c *UpstreamClient) ListTools(ctx context.Context) ([]Tool, error) {
 		if resp.StatusCode != http.StatusOK {
 			raw, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
 			resp.Body.Close()
-			return nil, fmt.Errorf("tools/list %s: HTTP %d: %s", c.serverName, resp.StatusCode, truncate(string(raw), 300))
+			return nil, c.statusError("tools/list", resp.StatusCode, raw)
 		}
 
 		msg, err := readFirstSSEMessage(resp.Body, "2")
@@ -244,7 +263,7 @@ func (c *UpstreamClient) CallTool(ctx context.Context, name string, args json.Ra
 
 	if resp.StatusCode != http.StatusOK {
 		raw, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
-		return nil, fmt.Errorf("tools/call %s: HTTP %d: %s", c.serverName, resp.StatusCode, truncate(string(raw), 300))
+		return nil, c.statusError("tools/call", resp.StatusCode, raw)
 	}
 
 	msg, err := readFirstSSEMessage(resp.Body, "3")
@@ -280,6 +299,15 @@ func (c *UpstreamClient) Close(ctx context.Context) {
 	if err == nil {
 		resp.Body.Close()
 	}
+}
+
+// statusError formats a non-success upstream answer. For tenant upstreams a
+// redirect gets a specific message, since redirects are never followed.
+func (c *UpstreamClient) statusError(op string, status int, raw []byte) error {
+	if c.strict && status >= 300 && status < 400 {
+		return fmt.Errorf("%s %s: HTTP %d: redirects are not followed for tenant servers; register the final https URL", op, c.serverName, status)
+	}
+	return fmt.Errorf("%s %s: HTTP %d: %s", op, c.serverName, status, truncate(string(raw), 300))
 }
 
 func (c *UpstreamClient) applyHeaders(req *http.Request) {

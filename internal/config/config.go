@@ -20,11 +20,11 @@ type Config struct {
 	PostgresSSLMode  string // disable | require | verify-full (default disable)
 
 	// MCP behavior (config table defaults)
-	MCPTimeout       time.Duration // default 60s
-	MCPMaxAttempts   int           // default 1
-	SessionLifetime  time.Duration // 0 = infinite
-	MaxTotalConns    int           // default 100
-	MaxConnsPerServer int          // default 5
+	MCPTimeout        time.Duration // default 60s
+	MCPMaxAttempts    int           // default 1
+	SessionLifetime   time.Duration // 0 = infinite
+	MaxTotalConns     int           // default 100
+	MaxConnsPerServer int           // default 5
 
 	// Logging
 	LogLevel string
@@ -44,6 +44,21 @@ type Config struct {
 
 	// SaaS: daily tool-call cap during trial (abuse protection). 0 = no cap.
 	TrialDailyLimit int64
+
+	// SaaS phase 4: tenant self-serve upstreams.
+	// TenantAPIServiceToken authenticates the SaaS dashboard on the internal
+	// listener (>= 32 chars, `openssl rand -hex 32`). Empty = listener off.
+	TenantAPIServiceToken string
+	// TenantAPIInternalAddr is the service-only listener. It is never published
+	// to the host and Traefik has no route to it.
+	TenantAPIInternalAddr string
+	// TenantSecretKey seals tenant header values (AES-256-GCM). 32 bytes as
+	// base64 (`openssl rand -base64 32`) or 64 hex characters.
+	TenantSecretKey string
+	// TenantMaxServers caps the upstream servers one tenant may register.
+	TenantMaxServers int
+	// TenantTestPerMinute caps test/refresh calls per tenant per minute.
+	TenantTestPerMinute int
 }
 
 func Get() *Config {
@@ -68,8 +83,14 @@ func Get() *Config {
 		AdminIPAllowlist: getEnv("ADMIN_IP_ALLOWLIST", ""),
 		// SaaS tenant base host: "mcp.subimpact.net" means tenant slugs
 		// resolve from "<slug>.mcp.subimpact.net". Empty = single-tenant.
-		TenantBaseHost: getEnv("TENANT_BASE_HOST", ""),
+		TenantBaseHost:  getEnv("TENANT_BASE_HOST", ""),
 		TrialDailyLimit: getEnvInt64("TRIAL_DAILY_LIMIT", 0),
+
+		TenantAPIServiceToken: getEnv("TENANT_API_SERVICE_TOKEN", ""),
+		TenantAPIInternalAddr: getEnv("TENANT_API_INTERNAL_ADDR", ":12013"),
+		TenantSecretKey:       getEnv("TENANT_SECRET_KEY", ""),
+		TenantMaxServers:      getEnvInt("TENANT_MAX_SERVERS", 10),
+		TenantTestPerMinute:   getEnvInt("TENANT_TEST_PER_MINUTE", 10),
 	}
 }
 

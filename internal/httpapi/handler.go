@@ -16,8 +16,9 @@ import (
 	"github.com/subimpact/submcp/internal/ui"
 )
 
-// Build assembles the root handler: admin UI at /, gateway routes,
-// health/ready/metrics, all wrapped in request logging.
+// Build assembles the public root handler: admin UI at /, gateway routes,
+// health/ready/metrics, the tenant API (X-API-Key auth), all wrapped in request
+// logging.
 func Build(logger *slog.Logger, srv *mcp.Server, adminUI *ui.UI) http.Handler {
 	root := http.NewServeMux()
 	root.Handle("/", adminUI.Handler())
@@ -25,7 +26,19 @@ func Build(logger *slog.Logger, srv *mcp.Server, adminUI *ui.UI) http.Handler {
 	root.Handle("/ready", srv.Handler())
 	root.Handle("/metrics", srv.Handler())
 	root.Handle("/metamcp/", srv.Handler())
+	// SaaS phase 4: tenant self-serve upstreams, X-API-Key auth only.
+	root.Handle("/api/tenant/", srv.TenantAPIHandler())
 
+	return withRequestLogging(logger, root)
+}
+
+// BuildInternal assembles the service-only listener (TENANT_API_INTERNAL_ADDR).
+// It serves the tenant API with service-token auth and nothing else. The port
+// is not published to the host and Traefik has no route to it; only containers
+// on the gateway's docker networks can reach it.
+func BuildInternal(logger *slog.Logger, srv *mcp.Server) http.Handler {
+	root := http.NewServeMux()
+	root.Handle("/api/tenant/", srv.TenantAPIInternalHandler())
 	return withRequestLogging(logger, root)
 }
 

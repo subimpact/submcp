@@ -58,6 +58,18 @@ func main() {
 	// P1-3: SSRF guard — always block metadata/loopback; RFC1918 allowed
 	// per ALLOW_PRIVATE_UPSTREAMS (default ON self-hosted).
 	agg := mcp.NewAggregatorWithSSRF(pool, dbPool, mcp.NewSSRFGuard(cfg.AllowPrivateUpstreams))
+	// SaaS Phase 4: tenant upstreams use the strict network policy (public
+	// HTTPS only) and seal their credentials with TENANT_SECRET_KEY. A malformed
+	// key stops startup rather than storing or reading credentials under it.
+	var secretBox *mcp.SecretBox
+	if cfg.TenantSecretKey != "" {
+		box, err := mcp.NewSecretBox(cfg.TenantSecretKey)
+		if err != nil {
+			log.Fatalf("TENANT_SECRET_KEY: %v", err)
+		}
+		secretBox = box
+	}
+	agg.SetTenantUpstreams(secretBox, mcp.DefaultTenantNetPolicy())
 	auth := mcp.NewAuth(dbPool)
 	srv := mcp.NewServer(dbPool, agg, pool, auth, cfg.SessionLifetime)
 	// SaaS Phase 1: tenant entitlement + trial usage cap. Enabled only when
@@ -65,6 +77,14 @@ func main() {
 	// (no TENANT_BASE_HOST) keeps working untouched.
 	if cfg.TenantBaseHost != "" {
 		srv.EnableTenants(dbPool, cfg.TenantBaseHost, cfg.TrialDailyLimit)
+		// SaaS Phase 4: tenant self-serve upstreams (public API with X-API-Key).
+		if err := srv.EnableTenantAPI(dbPool, mcp.TenantAPIConfig{
+			ServiceToken:  cfg.TenantAPIServiceToken,
+			MaxServers:    cfg.TenantMaxServers,
+			TestPerMinute: cfg.TenantTestPerMinute,
+		}); err != nil {
+			log.Fatalf("tenant api: %v", err)
+		}
 	}
 
 	// Admin UI (embedded, mounted at /). P2-3: optional admin IP
@@ -97,8 +117,8 @@ func main() {
 		// reaps idle keep-alive conns. WriteTimeout is deliberately NOT
 		// set — SSE streams (streamable GET, legacy /sse) are long-lived
 		// and a write deadline would kill them mid-stream.
-		ReadTimeout:  30 * time.Second,
-		IdleTimeout:  120 * time.Second,
+		ReadTimeout: 30 * time.Second,
+		IdleTimeout: 120 * time.Second,
 	}
 
 	go func() {
@@ -108,6 +128,26 @@ func main() {
 		}
 	}()
 
+	// SaaS Phase 4: service-only listener for the SaaS dashboard. It starts only
+	// with a service token, and it is never published to the host (see
+	// httpapi.BuildInternal and scripts/deploy-blue-green.sh).
+	var internalServer *http.Server
+	if cfg.TenantAPIServiceToken != "" && srv.TenantAPIEnabled() {
+		internalServer = &http.Server{
+			Addr:              cfg.TenantAPIInternalAddr,
+			Handler:           httpapi.BuildInternal(logger, srv),
+			ReadHeaderTimeout: 10 * time.Second,
+			ReadTimeout:       30 * time.Second,
+			IdleTimeout:       120 * time.Second,
+		}
+		go func() {
+			log.Printf("tenant API (service auth) listening on %s", cfg.TenantAPIInternalAddr)
+			if err := internalServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+				log.Fatalf("tenant api listen: %v", err)
+			}
+		}()
+	}
+
 	// Graceful shutdown.
 	stop := make(chan os.Signal, 1)
 	signal.Notify(stop, os.Interrupt, syscall.SIGTERM)
@@ -116,4 +156,7 @@ func main() {
 	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer shutdownCancel()
 	_ = httpServer.Shutdown(shutdownCtx)
+	if internalServer != nil {
+		_ = internalServer.Shutdown(shutdownCtx)
+	}
 }

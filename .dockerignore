@@ -1,0 +1,12 @@
+# Keep secrets, database dumps and local artifacts out of the build context.
+# The builder stage copies the whole context, so anything listed here would
+# otherwise end up in an intermediate image layer.
+.git
+.env
+.env.*
+backups/
+fixtures/
+bin/
+schema/
+*.dump
+*.test

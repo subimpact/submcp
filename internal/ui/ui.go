@@ -410,10 +410,12 @@ func (u *UI) handleLogout(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
 }
 
-// maskServer strips the bearer token from a server before it leaves the
-// admin API (security fix: no credential exfiltration via overview).
+// maskServer strips the bearer token and masks header values before a server
+// leaves the admin API (security fix: no credential exfiltration via overview).
+// Only the last four characters of a header value are ever shown.
 func maskServer(s db.MCPServer) db.MCPServer {
 	s.BearerToken = nil
+	s.Headers = mcp.MaskHeadersJSON(s.Headers)
 	return s
 }
 
@@ -527,7 +529,7 @@ func (u *UI) handleServers(w http.ResponseWriter, r *http.Request) {
 			writeInternalError(w, "create_server", err)
 			return
 		}
-		writeJSON(w, http.StatusCreated, map[string]any{"server": s})
+		writeJSON(w, http.StatusCreated, map[string]any{"server": maskServer(s)})
 	default:
 		writeJSON(w, http.StatusMethodNotAllowed, map[string]any{"error": "method_not_allowed"})
 	}
@@ -560,6 +562,15 @@ func (u *UI) handleServerItem(w http.ResponseWriter, r *http.Request) {
 			writeJSON(w, http.StatusNotFound, map[string]any{"error": "server_not_found"})
 			return
 		}
+		// Tenant-managed rows hold sealed credentials. The admin path never
+		// writes them; tenants change them through the tenant API.
+		if existing.TenantManaged {
+			writeJSON(w, http.StatusConflict, map[string]any{
+				"error":             "tenant_managed",
+				"error_description": "This server belongs to a tenant. Change it through the tenant API or the dashboard.",
+			})
+			return
+		}
 		if s.Args == nil {
 			s.Args = existing.Args
 		}
@@ -568,6 +579,20 @@ func (u *UI) handleServerItem(w http.ResponseWriter, r *http.Request) {
 		}
 		if s.Headers == nil {
 			s.Headers = existing.Headers
+		} else {
+			// The form shows masked header values; a masked value keeps the
+			// stored credential, anything else replaces it.
+			var submitted map[string]string
+			if err := json.Unmarshal(s.Headers, &submitted); err != nil {
+				writeJSON(w, http.StatusBadRequest, map[string]any{"error": "invalid_headers"})
+				return
+			}
+			merged, err := mcp.MergeMaskedHeaders(submitted, existing.Headers)
+			if err != nil {
+				writeJSON(w, http.StatusBadRequest, map[string]any{"error": "invalid_headers", "error_description": err.Error()})
+				return
+			}
+			s.Headers = merged
 		}
 		if err := u.db.UpdateServer(r.Context(), &s, sessUserID(r)); err != nil {
 			writeInternalError(w, "update_server", err)
@@ -591,6 +616,13 @@ func (u *UI) handleServerTest(w http.ResponseWriter, r *http.Request, id string)
 	srv, err := u.db.GetServer(r.Context(), id, sessUserID(r))
 	if err != nil || srv == nil {
 		writeJSON(w, http.StatusNotFound, map[string]any{"error": "server_not_found"})
+		return
+	}
+	if srv.TenantManaged {
+		writeJSON(w, http.StatusConflict, map[string]any{
+			"error":             "tenant_managed",
+			"error_description": "Test a tenant server from the dashboard or the tenant API.",
+		})
 		return
 	}
 	if srv.Type != db.ServerTypeStreamableHTTP || srv.URL == nil || *srv.URL == "" {

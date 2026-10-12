@@ -20,11 +20,13 @@ const (
 	TenantCanceled   TenantStatus = "canceled"
 )
 
-// PastDueGrace is how long a past_due tenant keeps access after
-// subscription_ends_at while Stripe retries the failed payment.
+// PastDueGrace is how long a past_due tenant keeps access, counted from
+// past_due_since (the moment the tenant became past_due). Stripe moves
+// current_period_end forward at each renewal, so it cannot anchor the grace.
 const PastDueGrace = 3 * 24 * time.Hour
 
-// Tenant is a row from tenants.
+// Tenant is a row from tenants. Billing state is written by the SaaS webhook;
+// the gateway only reads it.
 type Tenant struct {
 	ID                   string       `json:"id"`
 	UserID               string       `json:"user_id"`
@@ -36,21 +38,26 @@ type Tenant struct {
 	Plan                 string       `json:"plan"`
 	SubscriptionEndsAt   *time.Time   `json:"subscription_ends_at"`
 	CanceledAt           *time.Time   `json:"canceled_at"`
+	PastDueSince         *time.Time   `json:"past_due_since"`
 	CreatedAt            time.Time    `json:"created_at"`
 	UpdatedAt            time.Time    `json:"updated_at"`
 }
 
+// tenantCols lists the tenants columns read by scanTenant, in order.
+const tenantCols = `id, user_id, slug, status, trial_ends_at, stripe_customer_id,
+	stripe_subscription_id, plan, subscription_ends_at, canceled_at,
+	past_due_since, created_at, updated_at`
+
+func scanTenant(scan func(dest ...any) error, t *Tenant) error {
+	return scan(&t.ID, &t.UserID, &t.Slug, &t.Status, &t.TrialEndsAt,
+		&t.StripeCustomerID, &t.StripeSubscriptionID, &t.Plan, &t.SubscriptionEndsAt,
+		&t.CanceledAt, &t.PastDueSince, &t.CreatedAt, &t.UpdatedAt)
+}
+
 // GetTenantByID returns a tenant row by UUID.
 func (p *Pool) GetTenantByID(ctx context.Context, id string) (*Tenant, error) {
-	row := p.QueryRow(ctx, `
-		SELECT id, user_id, slug, status, trial_ends_at, stripe_customer_id,
-		       stripe_subscription_id, plan, subscription_ends_at, canceled_at,
-		       created_at, updated_at
-		FROM tenants WHERE id = $1`, id)
 	var t Tenant
-	err := row.Scan(&t.ID, &t.UserID, &t.Slug, &t.Status, &t.TrialEndsAt,
-		&t.StripeCustomerID, &t.StripeSubscriptionID, &t.Plan, &t.SubscriptionEndsAt,
-		&t.CanceledAt, &t.CreatedAt, &t.UpdatedAt)
+	err := scanTenant(p.QueryRow(ctx, `SELECT `+tenantCols+` FROM tenants WHERE id = $1`, id).Scan, &t)
 	if err == pgx.ErrNoRows {
 		return nil, nil
 	}
@@ -62,15 +69,8 @@ func (p *Pool) GetTenantByID(ctx context.Context, id string) (*Tenant, error) {
 
 // GetTenantByUserID returns a tenant row by the linked user id.
 func (p *Pool) GetTenantByUserID(ctx context.Context, userID string) (*Tenant, error) {
-	row := p.QueryRow(ctx, `
-		SELECT id, user_id, slug, status, trial_ends_at, stripe_customer_id,
-		       stripe_subscription_id, plan, subscription_ends_at, canceled_at,
-		       created_at, updated_at
-		FROM tenants WHERE user_id = $1`, userID)
 	var t Tenant
-	err := row.Scan(&t.ID, &t.UserID, &t.Slug, &t.Status, &t.TrialEndsAt,
-		&t.StripeCustomerID, &t.StripeSubscriptionID, &t.Plan, &t.SubscriptionEndsAt,
-		&t.CanceledAt, &t.CreatedAt, &t.UpdatedAt)
+	err := scanTenant(p.QueryRow(ctx, `SELECT `+tenantCols+` FROM tenants WHERE user_id = $1`, userID).Scan, &t)
 	if err == pgx.ErrNoRows {
 		return nil, nil
 	}
@@ -82,15 +82,8 @@ func (p *Pool) GetTenantByUserID(ctx context.Context, userID string) (*Tenant, e
 
 // GetTenantBySlug returns a tenant row by subdomain slug.
 func (p *Pool) GetTenantBySlug(ctx context.Context, slug string) (*Tenant, error) {
-	row := p.QueryRow(ctx, `
-		SELECT id, user_id, slug, status, trial_ends_at, stripe_customer_id,
-		       stripe_subscription_id, plan, subscription_ends_at, canceled_at,
-		       created_at, updated_at
-		FROM tenants WHERE slug = $1`, slug)
 	var t Tenant
-	err := row.Scan(&t.ID, &t.UserID, &t.Slug, &t.Status, &t.TrialEndsAt,
-		&t.StripeCustomerID, &t.StripeSubscriptionID, &t.Plan, &t.SubscriptionEndsAt,
-		&t.CanceledAt, &t.CreatedAt, &t.UpdatedAt)
+	err := scanTenant(p.QueryRow(ctx, `SELECT `+tenantCols+` FROM tenants WHERE slug = $1`, slug).Scan, &t)
 	if err == pgx.ErrNoRows {
 		return nil, nil
 	}
@@ -121,7 +114,8 @@ func (p *Pool) Entitlement(ctx context.Context, t *Tenant) (*TenantEntitlement, 
 // EvaluateEntitlement is the access rule, kept pure so it can be tested:
 //   - active   : allowed.
 //   - trialing : allowed while trial_ends_at is in the future.
-//   - past_due : allowed until subscription_ends_at + PastDueGrace (3 days).
+//   - past_due : allowed until past_due_since + PastDueGrace (3 days). A
+//     past_due tenant without past_due_since is denied (fail closed).
 //   - anything else (canceled, unpaid, incomplete, paused, unknown): denied.
 func EvaluateEntitlement(t *Tenant, now time.Time) *TenantEntitlement {
 	e := &TenantEntitlement{Tenant: t}
@@ -140,7 +134,7 @@ func EvaluateEntitlement(t *Tenant, now time.Time) *TenantEntitlement {
 		e.TrialEnded = true
 		return deny("trial_ended")
 	case TenantPastDue:
-		if t.SubscriptionEndsAt != nil && now.Before(t.SubscriptionEndsAt.Add(PastDueGrace)) {
+		if t.PastDueSince != nil && now.Before(t.PastDueSince.Add(PastDueGrace)) {
 			return e
 		}
 		return deny("payment_overdue")
@@ -210,68 +204,4 @@ func (p *Pool) UsageToday(ctx context.Context, tenantID string) (int64, error) {
 		return 0, err
 	}
 	return n, nil
-}
-
-// --- provisioning (used by the SaaS control plane) ---
-
-// ProvisionTenant creates the full tenant row for a user in one step.
-// The SaaS service calls this after creating the user (auth layer owns
-// users/sessions; this owns tenants). Idempotent on user_id and slug.
-func (p *Pool) ProvisionTenant(ctx context.Context, userID, slug string, trialDays int) (*Tenant, error) {
-	trialEnd := time.Now().Add(time.Duration(trialDays) * 24 * time.Hour)
-	row := p.QueryRow(ctx, `
-		INSERT INTO tenants (user_id, slug, status, trial_ends_at)
-		VALUES ($1, $2, 'trialing', $3)
-		ON CONFLICT (user_id) DO UPDATE SET slug = EXCLUDED.slug, updated_at = now()
-		RETURNING id, user_id, slug, status, trial_ends_at, stripe_customer_id,
-		          stripe_subscription_id, plan, subscription_ends_at, canceled_at,
-		          created_at, updated_at`,
-		userID, slug, trialEnd)
-	var t Tenant
-	err := row.Scan(&t.ID, &t.UserID, &t.Slug, &t.Status, &t.TrialEndsAt,
-		&t.StripeCustomerID, &t.StripeSubscriptionID, &t.Plan, &t.SubscriptionEndsAt,
-		&t.CanceledAt, &t.CreatedAt, &t.UpdatedAt)
-	if err != nil {
-		return nil, err
-	}
-	return &t, nil
-}
-
-// SetTenantSubscription links a Stripe subscription to a tenant (webhook path).
-func (p *Pool) SetTenantSubscription(ctx context.Context, tenantID, customerID, subscriptionID string, status TenantStatus, periodEnd *time.Time) error {
-	_, err := p.Exec(ctx, `
-		UPDATE tenants SET stripe_customer_id = $2, stripe_subscription_id = $3,
-		       status = $4, subscription_ends_at = $5, updated_at = now()
-		WHERE id = $1`,
-		tenantID, customerID, subscriptionID, status, periodEnd)
-	return err
-}
-
-// SetTenantStatus flips a tenant's status (webhook / reconcile path).
-func (p *Pool) SetTenantStatus(ctx context.Context, tenantID string, status TenantStatus) error {
-	_, err := p.Exec(ctx, `
-		UPDATE tenants SET status = $2, updated_at = now() WHERE id = $1`,
-		tenantID, status)
-	return err
-}
-
-// CancelTenant marks a tenant canceled (customer.subscription.deleted).
-// Data is kept (30-day grace) — the gateway denies until reactivation.
-func (p *Pool) CancelTenant(ctx context.Context, tenantID string) error {
-	_, err := p.Exec(ctx, `
-		UPDATE tenants SET status = 'canceled', canceled_at = now(), updated_at = now()
-		WHERE id = $1`, tenantID)
-	return err
-}
-
-// RecordStripeEvent logs a webhook event id for idempotency.
-// Returns false when the event was already seen (caller skips processing).
-func (p *Pool) RecordStripeEvent(ctx context.Context, eventID, eventType string) (bool, error) {
-	tag, err := p.Exec(ctx, `
-		INSERT INTO stripe_events (event_id, type) VALUES ($1, $2)
-		ON CONFLICT (event_id) DO NOTHING`, eventID, eventType)
-	if err != nil {
-		return false, err
-	}
-	return tag.RowsAffected() > 0, nil
 }

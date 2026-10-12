@@ -44,6 +44,11 @@ fi
 # silently fall back to the single-tenant lookup for every subdomain.
 : "${TENANT_BASE_HOST:=mcp.subimpact.net}"
 : "${TRIAL_DAILY_LIMIT:=1000}"
+# SaaS phase 4. The service token authenticates the SaaS dashboard on the
+# internal listener; the secret key seals tenant credentials at rest. Both are
+# required: a deploy without them would silently disable the tenant API.
+: "${TENANT_API_SERVICE_TOKEN:?TENANT_API_SERVICE_TOKEN must be set (openssl rand -hex 32; see .env.prod.example)}"
+: "${TENANT_SECRET_KEY:?TENANT_SECRET_KEY must be set (openssl rand -base64 32; see .env.prod.example)}"
 
 IMAGE="${1:-submcp:prod}"
 
@@ -108,6 +113,33 @@ for l in "${LABELS[@]}"; do
   ARGS+=(--label "$l")
 done
 
+# Same-host upstreams that live on another compose network. A container that
+# is recreated without these networks cannot resolve the upstream (pitfall 15):
+# the matrix MCP server (matrix-mcp) lives on the Matrix stack network, and
+# dropping it cut 20 operator tools until it was reattached. Every deploy
+# attaches them to the new container, idempotently.
+UPSTREAM_NETWORKS=(urhxt3a4nix782v8eo5da1cb)
+attach_upstream_networks() {
+  local net
+  for net in "${UPSTREAM_NETWORKS[@]}"; do
+    if ! docker inspect -f '{{json .NetworkSettings.Networks}}' "$1" | grep -q "\"$net\""; then
+      docker network connect "$net" "$1" || echo "WARN: could not attach $1 to $net" >&2
+    fi
+  done
+}
+
+# Tenant API env, shared by both containers. The internal listener is never
+# published (no -p); the SaaS reaches it as submcp-gateway:12013 on the uy2...
+# network through the alias below, which stays valid while blue/green renames
+# the containers.
+TENANT_ARGS=(
+  -e TENANT_API_SERVICE_TOKEN="$TENANT_API_SERVICE_TOKEN"
+  -e TENANT_SECRET_KEY="$TENANT_SECRET_KEY"
+  -e TENANT_API_INTERNAL_ADDR=":12013"
+  -e TENANT_MAX_SERVERS="${TENANT_MAX_SERVERS:-10}"
+  -e TENANT_TEST_PER_MINUTE="${TENANT_TEST_PER_MINUTE:-10}"
+)
+
 # Promote set: each label renamed once (-next -> prod). Renaming in a single
 # pass keeps the prod container free of stale -next router names.
 PROD_ARGS=()
@@ -120,7 +152,7 @@ done
 echo "==> [1/6] starting submcp-prod-next (probe port 12009)"
 docker rm -f submcp-prod-next 2>/dev/null || true
 docker run -d --name submcp-prod-next --restart unless-stopped \
-  --network uy2gf2yhgu9cqi16y69is4ni --network shared \
+  --network uy2gf2yhgu9cqi16y69is4ni --network-alias submcp-gateway --network shared \
   -p 127.0.0.1:12009:12008 \
   -e POSTGRES_HOST="$POSTGRES_HOST" -e POSTGRES_PORT="$POSTGRES_PORT" \
   -e POSTGRES_USER="$POSTGRES_USER" \
@@ -129,8 +161,11 @@ docker run -d --name submcp-prod-next --restart unless-stopped \
   -e LISTEN_ADDR=:12008 \
   -e TENANT_BASE_HOST="$TENANT_BASE_HOST" \
   -e TRIAL_DAILY_LIMIT="$TRIAL_DAILY_LIMIT" \
+  "${TENANT_ARGS[@]}" \
   "${ARGS[@]}" \
   "$IMAGE"
+
+attach_upstream_networks submcp-prod-next
 
 echo "==> [2/6] waiting for health"
 for i in $(seq 1 30); do
@@ -161,7 +196,7 @@ docker rm submcp-prod 2>/dev/null || true
 echo "==> [5/6] promoting next -> prod with host port 12008 (Tailscale)"
 docker rm -f submcp-prod-next 2>/dev/null || true
 docker run -d --name submcp-prod --restart unless-stopped \
-  --network uy2gf2yhgu9cqi16y69is4ni --network shared \
+  --network uy2gf2yhgu9cqi16y69is4ni --network-alias submcp-gateway --network shared \
   -p 127.0.0.1:12008:12008 \
   -e POSTGRES_HOST="$POSTGRES_HOST" -e POSTGRES_PORT="$POSTGRES_PORT" \
   -e POSTGRES_USER="$POSTGRES_USER" \
@@ -170,8 +205,11 @@ docker run -d --name submcp-prod --restart unless-stopped \
   -e LISTEN_ADDR=:12008 \
   -e TENANT_BASE_HOST="$TENANT_BASE_HOST" \
   -e TRIAL_DAILY_LIMIT="$TRIAL_DAILY_LIMIT" \
+  "${TENANT_ARGS[@]}" \
   "${PROD_ARGS[@]}" \
   "$IMAGE"
+
+attach_upstream_networks submcp-prod
 
 echo "==> [6/6] verifying all entry points"
 for i in $(seq 1 30); do

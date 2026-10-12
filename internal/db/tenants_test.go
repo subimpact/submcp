@@ -23,11 +23,13 @@ func TestEvaluateEntitlement(t *testing.T) {
 		{"trialing after trial_ends_at", Tenant{Status: TenantTrialing, TrialEndsAt: at(-time.Minute)}, true, "trial_ended"},
 		{"trialing with no trial end is denied", Tenant{Status: TenantTrialing}, true, "trial_ended"},
 
-		{"past_due inside grace", Tenant{Status: TenantPastDue, SubscriptionEndsAt: at(-24 * time.Hour)}, false, ""},
-		{"past_due one minute before grace ends", Tenant{Status: TenantPastDue, SubscriptionEndsAt: at(-3*24*time.Hour + time.Minute)}, false, ""},
-		{"past_due one minute after grace ends", Tenant{Status: TenantPastDue, SubscriptionEndsAt: at(-3*24*time.Hour - time.Minute)}, true, "payment_overdue"},
-		{"past_due after the old 7-day grace is denied", Tenant{Status: TenantPastDue, SubscriptionEndsAt: at(-5 * 24 * time.Hour)}, true, "payment_overdue"},
-		{"past_due without a period end is denied", Tenant{Status: TenantPastDue}, true, "payment_overdue"},
+		// Grace runs from past_due_since, not from the period end.
+		{"past_due inside grace", Tenant{Status: TenantPastDue, PastDueSince: at(-24 * time.Hour)}, false, ""},
+		{"past_due one minute before grace ends", Tenant{Status: TenantPastDue, PastDueSince: at(-3*24*time.Hour + time.Minute)}, false, ""},
+		{"past_due one minute after grace ends", Tenant{Status: TenantPastDue, PastDueSince: at(-3*24*time.Hour - time.Minute)}, true, "payment_overdue"},
+		{"past_due 4 days after it began is denied", Tenant{Status: TenantPastDue, PastDueSince: at(-4 * 24 * time.Hour)}, true, "payment_overdue"},
+		{"a late period end does not extend past_due", Tenant{Status: TenantPastDue, PastDueSince: at(-4 * 24 * time.Hour), SubscriptionEndsAt: at(30 * 24 * time.Hour)}, true, "payment_overdue"},
+		{"past_due without past_due_since is denied", Tenant{Status: TenantPastDue, SubscriptionEndsAt: at(time.Hour)}, true, "payment_overdue"},
 
 		{"unpaid is denied", Tenant{Status: TenantUnpaid, SubscriptionEndsAt: at(time.Hour)}, true, "payment_overdue"},
 		{"incomplete is denied", Tenant{Status: TenantIncomplete}, true, "payment_required"},

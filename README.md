@@ -36,6 +36,7 @@ LISTEN_ADDR=:12009 \
 | `/metamcp/:endpoint/sse` | GET | Legacy SSE transport |
 | `/metamcp/:endpoint/message` | POST | SSE message endpoint |
 | `/health` | GET | Health check |
+| `/api/tenant/servers` (and `/{id}`, `/{id}/test`, `/{id}/refresh`, `/tools`) | GET, POST, PATCH, DELETE | Tenant self-serve upstreams. `X-API-Key` (tenant key) on the public listener |
 
 ## Configuration
 
@@ -54,6 +55,29 @@ All configuration is via environment variables:
 | `MAX_TOTAL_CONNECTIONS` | `100` | Upstream connection pool cap |
 | `MAX_CONNECTIONS_PER_SERVER` | `5` | Per-server pool cap |
 | `LOG_LEVEL` | `info` | Log level |
+| `TENANT_BASE_HOST` | none | Tenant subdomain base (for example `mcp.example.com`). Enables tenant mode |
+| `TENANT_API_SERVICE_TOKEN` | none | Shared secret for the internal tenant API listener (32+ characters). Unset disables the listener |
+| `TENANT_API_INTERNAL_ADDR` | `:12013` | Service-only listener. Never publish it to the host or a router |
+| `TENANT_SECRET_KEY` | none | 32-byte key (base64 or 64 hex) that seals tenant credentials at rest (AES-256-GCM). Losing it loses those credentials |
+| `TENANT_MAX_SERVERS` | `10` | Upstream servers per tenant |
+| `TENANT_TEST_PER_MINUTE` | `10` | Test/refresh calls per tenant per minute |
+
+## Tenant upstreams
+
+Tenants register their own remote MCP servers through the tenant API. Each
+server joins the tenant's `all` endpoint without a restart. Rules that apply
+to tenant servers (operator servers are unchanged):
+
+- Streamable HTTP or SSE only. STDIO is refused, since it would run a command on the host.
+- `https://` hostnames on port 443 only. IP literals, single-label names, and
+  `localhost`-style names are refused. No credentials or query strings in the URL.
+- Every name is resolved and every address is checked against the private,
+  loopback, link-local, CGNAT, metadata and reserved ranges. The connection is
+  dialed only to checked addresses, so DNS rebinding does not help. Redirects
+  are not followed.
+- Header values are sealed at rest and shown masked (last four characters).
+- Test and refresh are rate limited per tenant. Inactive tenants can read and
+  remove servers but not add, change or test them.
 
 ## Database
 
