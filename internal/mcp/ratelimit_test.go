@@ -1,9 +1,11 @@
 package mcp
 
 import (
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"testing"
+	"time"
 )
 
 func TestRateLimiterAllowsBurst(t *testing.T) {
@@ -43,5 +45,35 @@ func TestRateLimiterMiddleware429(t *testing.T) {
 	h.ServeHTTP(rr2, req)
 	if rr2.Code != http.StatusTooManyRequests {
 		t.Fatalf("second request must 429, got %d", rr2.Code)
+	}
+}
+
+// N4 (SaaS 4c): the limiter holds at most rateLimitMaxKeys keys, and Allow stays
+// fast when the table is full. Before the fix the map grew without bound and each
+// Allow scanned every key under the lock (1.24 ms at 50k keys).
+func TestN4RateLimiterIsBoundedAndFast(t *testing.T) {
+	l := NewRateLimiter(60, 60)
+	const keys = 100000
+	var worst time.Duration
+	var total time.Duration
+	for i := 0; i < keys; i++ {
+		key := fmt.Sprintf("10.%d.%d.%d", (i>>16)&255, (i>>8)&255, i&255)
+		start := time.Now()
+		l.Allow(key)
+		el := time.Since(start)
+		total += el
+		if el > worst {
+			worst = el
+		}
+	}
+	if n := len(l.index); n > rateLimitMaxKeys || n != l.order.Len() {
+		t.Fatalf("after %d distinct keys the limiter holds %d (list %d), cap %d", keys, n, l.order.Len(), rateLimitMaxKeys)
+	}
+	if mean := total / keys; mean > 50*time.Microsecond {
+		t.Fatalf("mean Allow over the fill = %s, want under 50µs", mean)
+	}
+	// An evicted client gets a fresh bucket (the LRU is the only state lost).
+	if !l.Allow("10.0.0.0") {
+		t.Fatalf("an evicted key must start with a full bucket")
 	}
 }

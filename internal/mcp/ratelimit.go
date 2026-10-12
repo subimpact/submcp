@@ -1,23 +1,31 @@
 package mcp
 
 import (
+	"container/list"
 	"net/http"
 	"sync"
 	"time"
 )
+
+// rateLimitMaxKeys bounds the number of keys (client addresses) the limiter
+// tracks. Past the cap the least recently used key is evicted (SaaS 4c, N4): the
+// old map was never evicted and every Allow was a scan above 10k keys.
+const rateLimitMaxKeys = 50000
 
 // RateLimiter is a per-IP token bucket (P1-6 API rate limiting).
 // Defaults: 60 requests/sec with burst 60 (generous for MCP clients,
 // stops runaway loops and abuse). NOTE: rate is tokens per SECOND.
 type RateLimiter struct {
 	mu      sync.Mutex
-	buckets map[string]*bucket
+	index   map[string]*list.Element // key -> element whose Value is *limiterEntry
+	order   *list.List               // front = most recently used
+	maxKeys int
 	rate    float64 // tokens per second
 	burst   float64
-	lastGC  time.Time
 }
 
-type bucket struct {
+type limiterEntry struct {
+	key    string
 	tokens float64
 	last   time.Time
 }
@@ -25,11 +33,19 @@ type bucket struct {
 // NewRateLimiter creates a limiter with the given rate (tokens/sec) and
 // burst capacity.
 func NewRateLimiter(rate, burst float64) *RateLimiter {
+	return newRateLimiterCapped(rate, burst, rateLimitMaxKeys)
+}
+
+func newRateLimiterCapped(rate, burst float64, maxKeys int) *RateLimiter {
+	if maxKeys < 1 {
+		maxKeys = 1
+	}
 	return &RateLimiter{
-		buckets: make(map[string]*bucket),
+		index:   make(map[string]*list.Element),
+		order:   list.New(),
+		maxKeys: maxKeys,
 		rate:    rate,
 		burst:   burst,
-		lastGC:  time.Now(),
 	}
 }
 
@@ -39,31 +55,29 @@ func (l *RateLimiter) Allow(key string) bool {
 	defer l.mu.Unlock()
 
 	now := time.Now()
-	// Opportunistic GC of stale buckets (every 5 min).
-	if now.Sub(l.lastGC) > 5*time.Minute {
-		for k, b := range l.buckets {
-			if now.Sub(b.last) > 10*time.Minute {
-				delete(l.buckets, k)
-			}
+	var e *limiterEntry
+	if el, ok := l.index[key]; ok {
+		l.order.MoveToFront(el)
+		e = el.Value.(*limiterEntry)
+	} else {
+		e = &limiterEntry{key: key, tokens: l.burst, last: now}
+		l.index[key] = l.order.PushFront(e)
+		for l.order.Len() > l.maxKeys {
+			old := l.order.Back()
+			l.order.Remove(old)
+			delete(l.index, old.Value.(*limiterEntry).key)
 		}
-		l.lastGC = now
-	}
-
-	b, ok := l.buckets[key]
-	if !ok {
-		b = &bucket{tokens: l.burst, last: now}
-		l.buckets[key] = b
 	}
 	// Refill.
-	elapsed := now.Sub(b.last).Seconds()
-	b.tokens += elapsed * l.rate
-	if b.tokens > l.burst {
-		b.tokens = l.burst
+	elapsed := now.Sub(e.last).Seconds()
+	e.tokens += elapsed * l.rate
+	if e.tokens > l.burst {
+		e.tokens = l.burst
 	}
-	b.last = now
+	e.last = now
 
-	if b.tokens >= 1 {
-		b.tokens--
+	if e.tokens >= 1 {
+		e.tokens--
 		return true
 	}
 	return false
