@@ -35,6 +35,7 @@ func TestEvaluateEntitlement(t *testing.T) {
 		{"incomplete is denied", Tenant{Status: TenantIncomplete}, true, "payment_required"},
 		{"paused is denied", Tenant{Status: TenantPaused}, true, "subscription_paused"},
 		{"canceled is denied even inside a trial window", Tenant{Status: TenantCanceled, TrialEndsAt: at(time.Hour)}, true, "subscription_canceled"},
+		{"pending verification is denied even with a future trial end", Tenant{Status: TenantPendingVerification, TrialEndsAt: at(time.Hour)}, true, "email_unverified"},
 		{"unknown status is denied", Tenant{Status: TenantStatus("mystery")}, true, "unknown_tenant_status"},
 	}
 	for _, c := range cases {

@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -117,6 +118,44 @@ func TestEntitlementDeniesCanceledAndPastTrial(t *testing.T) {
 	}
 	if rec3.Code != http.StatusPaymentRequired {
 		t.Fatalf("expected 402, got %d", rec3.Code)
+	}
+}
+
+// An unconfirmed address is refused with 403 email_unverified (no trial clock
+// runs yet); a lapsed trial keeps the 402 billing answer.
+func TestEntitlementDeniesUnverifiedWith403(t *testing.T) {
+	now := time.Now()
+	g := &tenantGate{
+		store: &fakeTenantStore{
+			tenants: map[string]*db.Tenant{
+				"u1": ten("t1", "u1", "acme", "pending_verification", time.Time{}),
+				"u2": ten("t2", "u2", "beta", "trialing", now.Add(-time.Hour)),
+			},
+			usage: map[string]int64{},
+		},
+		baseHost: "mcp.subimpact.net",
+	}
+	req := httptest.NewRequest(http.MethodPost, "https://acme.mcp.subimpact.net/metamcp/all/mcp", nil)
+
+	t1, _ := g.store.GetTenantByUserID(context.Background(), "u1")
+	rec := httptest.NewRecorder()
+	if g.checkEntitlement(rec, req, t1) {
+		t.Fatal("expected denial for an unverified tenant")
+	}
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("unverified: status %d, want 403", rec.Code)
+	}
+	if !strings.Contains(rec.Body.String(), `"error":"email_unverified"`) {
+		t.Fatalf("unverified: body %s does not name email_unverified", rec.Body.String())
+	}
+
+	t2, _ := g.store.GetTenantByUserID(context.Background(), "u2")
+	rec2 := httptest.NewRecorder()
+	if g.checkEntitlement(rec2, req, t2) {
+		t.Fatal("expected denial for an expired trial")
+	}
+	if rec2.Code != http.StatusPaymentRequired {
+		t.Fatalf("expired trial: status %d, want 402", rec2.Code)
 	}
 }
 

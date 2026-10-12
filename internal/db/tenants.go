@@ -18,6 +18,9 @@ const (
 	TenantIncomplete TenantStatus = "incomplete"
 	TenantPaused     TenantStatus = "paused"
 	TenantCanceled   TenantStatus = "canceled"
+	// TenantPendingVerification: the account exists but its email address is
+	// not confirmed yet. No trial clock runs and the gateway denies access.
+	TenantPendingVerification TenantStatus = "pending_verification"
 )
 
 // PastDueGrace is how long a past_due tenant keeps access, counted from
@@ -116,6 +119,7 @@ func (p *Pool) Entitlement(ctx context.Context, t *Tenant) (*TenantEntitlement, 
 //   - trialing : allowed while trial_ends_at is in the future.
 //   - past_due : allowed until past_due_since + PastDueGrace (3 days). A
 //     past_due tenant without past_due_since is denied (fail closed).
+//   - pending_verification: denied with reason email_unverified (403 at the gateway).
 //   - anything else (canceled, unpaid, incomplete, paused, unknown): denied.
 func EvaluateEntitlement(t *Tenant, now time.Time) *TenantEntitlement {
 	e := &TenantEntitlement{Tenant: t}
@@ -146,6 +150,8 @@ func EvaluateEntitlement(t *Tenant, now time.Time) *TenantEntitlement {
 		return deny("subscription_paused")
 	case TenantCanceled:
 		return deny("subscription_canceled")
+	case TenantPendingVerification:
+		return deny("email_unverified")
 	default:
 		return deny("unknown_tenant_status")
 	}
