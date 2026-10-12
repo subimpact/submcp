@@ -440,7 +440,7 @@ func (s *Server) handlePost(w http.ResponseWriter, r *http.Request, ep *db.Endpo
 			writeSSE(w, r, newResponse(req.ID, nil, &RPCError{Code: CodeInternalError, Message: err.Error()}))
 			return
 		}
-		writeSSE(w, r, newResponse(req.ID, map[string]any{"tools": tools}, nil))
+		writeSSE(w, r, newResponse(req.ID, toolsListResult(tools), nil))
 	case "tools/call":
 		nsUUID, ok := s.sessions.Get(sessionID, ep.UUID)
 		if !ok {
@@ -680,7 +680,7 @@ func (s *Server) handleSSEMessage(w http.ResponseWriter, r *http.Request, ep *db
 			writeJSONError(w, http.StatusInternalServerError, "internal_error", err.Error())
 			return
 		}
-		result, _ = json.Marshal(map[string]any{"tools": tools})
+		result, _ = json.Marshal(toolsListResult(tools))
 	case "tools/call":
 		var params CallToolParams
 		if len(req.Params) > 0 {
@@ -753,6 +753,16 @@ func newResponse(id json.RawMessage, result any, rpcErr *RPCError) Response {
 
 // writeSSE writes a JSON-RPC response as an SSE event (parity with the
 // original streamable-http.ts which always uses SSE framing).
+// toolsListResult wraps the tools/list payload. A nil slice (no upstreams or
+// no tools yet, e.g. a new tenant) must marshal as [] per the MCP schema,
+// never as null.
+func toolsListResult(tools []Tool) map[string]any {
+	if tools == nil {
+		tools = []Tool{}
+	}
+	return map[string]any{"tools": tools}
+}
+
 func writeSSE(w http.ResponseWriter, r *http.Request, resp Response) {
 	// If the client explicitly asked for JSON (no SSE), return plain JSON.
 	accept := r.Header.Get("Accept")

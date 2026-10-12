@@ -11,26 +11,33 @@ import (
 type TenantStatus string
 
 const (
-	TenantTrialing TenantStatus = "trialing"
-	TenantActive   TenantStatus = "active"
-	TenantPastDue  TenantStatus = "past_due"
-	TenantCanceled TenantStatus = "canceled"
+	TenantTrialing   TenantStatus = "trialing"
+	TenantActive     TenantStatus = "active"
+	TenantPastDue    TenantStatus = "past_due"
+	TenantUnpaid     TenantStatus = "unpaid"
+	TenantIncomplete TenantStatus = "incomplete"
+	TenantPaused     TenantStatus = "paused"
+	TenantCanceled   TenantStatus = "canceled"
 )
+
+// PastDueGrace is how long a past_due tenant keeps access after
+// subscription_ends_at while Stripe retries the failed payment.
+const PastDueGrace = 3 * 24 * time.Hour
 
 // Tenant is a row from tenants.
 type Tenant struct {
-	ID                    string       `json:"id"`
-	UserID                string       `json:"user_id"`
-	Slug                  string       `json:"slug"`
-	Status                TenantStatus `json:"status"`
-	TrialEndsAt           *time.Time   `json:"trial_ends_at"`
-	StripeCustomerID      *string      `json:"stripe_customer_id"`
-	StripeSubscriptionID  *string      `json:"stripe_subscription_id"`
-	Plan                  string       `json:"plan"`
-	SubscriptionEndsAt    *time.Time   `json:"subscription_ends_at"`
-	CanceledAt            *time.Time   `json:"canceled_at"`
-	CreatedAt             time.Time    `json:"created_at"`
-	UpdatedAt             time.Time    `json:"updated_at"`
+	ID                   string       `json:"id"`
+	UserID               string       `json:"user_id"`
+	Slug                 string       `json:"slug"`
+	Status               TenantStatus `json:"status"`
+	TrialEndsAt          *time.Time   `json:"trial_ends_at"`
+	StripeCustomerID     *string      `json:"stripe_customer_id"`
+	StripeSubscriptionID *string      `json:"stripe_subscription_id"`
+	Plan                 string       `json:"plan"`
+	SubscriptionEndsAt   *time.Time   `json:"subscription_ends_at"`
+	CanceledAt           *time.Time   `json:"canceled_at"`
+	CreatedAt            time.Time    `json:"created_at"`
+	UpdatedAt            time.Time    `json:"updated_at"`
 }
 
 // GetTenantByID returns a tenant row by UUID.
@@ -94,46 +101,60 @@ func (p *Pool) GetTenantBySlug(ctx context.Context, slug string) (*Tenant, error
 }
 
 // TenantEntitlement is the computed access decision for a tenant.
-// Denied=false means the gateway must reject (trial over / canceled / past-due).
+// Denied=true means the gateway must reject the request with Reason.
 type TenantEntitlement struct {
-	Tenant   *Tenant
-	Denied   bool
-	Reason   string
+	Tenant *Tenant
+	Denied bool
+	Reason string
 	// TrialEnded reports that a trialing tenant is past trial_ends_at but
 	// not yet canceled (Stripe webhook may lag by seconds).
 	TrialEnded bool
 }
 
-// Entitlement computes whether a tenant may use the gateway right now.
-//   - trialing: allowed until trial_ends_at (usage cap still applies)
-//   - active  : allowed (subscription current)
-//   - past_due: allowed for PAYMENT_GRACE (default 7d), then denied
-//   - canceled: denied (data grace 30d for re-subscribe, gateway off)
+// Entitlement reports whether a tenant may use the gateway right now. It
+// reads only the tenant row, so each request sees the status the Stripe
+// webhook last wrote.
 func (p *Pool) Entitlement(ctx context.Context, t *Tenant) (*TenantEntitlement, error) {
-	now := time.Now()
+	return EvaluateEntitlement(t, time.Now()), nil
+}
+
+// EvaluateEntitlement is the access rule, kept pure so it can be tested:
+//   - active   : allowed.
+//   - trialing : allowed while trial_ends_at is in the future.
+//   - past_due : allowed until subscription_ends_at + PastDueGrace (3 days).
+//   - anything else (canceled, unpaid, incomplete, paused, unknown): denied.
+func EvaluateEntitlement(t *Tenant, now time.Time) *TenantEntitlement {
 	e := &TenantEntitlement{Tenant: t}
-	switch t.Status {
-	case TenantTrialing:
-		if t.TrialEndsAt != nil && now.After(*t.TrialEndsAt) {
-			e.Denied = true
-			e.TrialEnded = true
-			e.Reason = "trial_ended"
-		}
-	case TenantActive:
-		// subscription current — allowed.
-	case TenantPastDue:
-		if t.SubscriptionEndsAt == nil || now.Sub(*t.SubscriptionEndsAt) > 7*24*time.Hour {
-			e.Denied = true
-			e.Reason = "payment_overdue"
-		}
-	case TenantCanceled:
+	deny := func(reason string) *TenantEntitlement {
 		e.Denied = true
-		e.Reason = "subscription_canceled"
-	default:
-		e.Denied = true
-		e.Reason = "unknown_tenant_status"
+		e.Reason = reason
+		return e
 	}
-	return e, nil
+	switch t.Status {
+	case TenantActive:
+		return e
+	case TenantTrialing:
+		if t.TrialEndsAt != nil && now.Before(*t.TrialEndsAt) {
+			return e
+		}
+		e.TrialEnded = true
+		return deny("trial_ended")
+	case TenantPastDue:
+		if t.SubscriptionEndsAt != nil && now.Before(t.SubscriptionEndsAt.Add(PastDueGrace)) {
+			return e
+		}
+		return deny("payment_overdue")
+	case TenantUnpaid:
+		return deny("payment_overdue")
+	case TenantIncomplete:
+		return deny("payment_required")
+	case TenantPaused:
+		return deny("subscription_paused")
+	case TenantCanceled:
+		return deny("subscription_canceled")
+	default:
+		return deny("unknown_tenant_status")
+	}
 }
 
 // BumpUsage increments the tenant's daily tool-call counter (usage cap).

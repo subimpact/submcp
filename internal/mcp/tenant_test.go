@@ -28,26 +28,11 @@ func (f *fakeTenantStore) GetTenantBySlug(_ context.Context, slug string) (*db.T
 	}
 	return nil, nil
 }
+
+// Entitlement delegates to the production rule so the gateway tests
+// exercise the same logic the deployed binary runs.
 func (f *fakeTenantStore) Entitlement(_ context.Context, t *db.Tenant) (*db.TenantEntitlement, error) {
-	e := &db.TenantEntitlement{Tenant: t}
-	now := time.Now()
-	switch t.Status {
-	case db.TenantTrialing:
-		if t.TrialEndsAt != nil && now.After(*t.TrialEndsAt) {
-			e.Denied = true
-			e.TrialEnded = true
-			e.Reason = "trial_ended"
-		}
-	case db.TenantPastDue:
-		if t.SubscriptionEndsAt == nil || now.Sub(*t.SubscriptionEndsAt) > 7*24*time.Hour {
-			e.Denied = true
-			e.Reason = "payment_overdue"
-		}
-	case db.TenantCanceled:
-		e.Denied = true
-		e.Reason = "subscription_canceled"
-	}
-	return e, nil
+	return db.EvaluateEntitlement(t, time.Now()), nil
 }
 func (f *fakeTenantStore) UsageToday(_ context.Context, tenantID string) (int64, error) {
 	return f.usage[tenantID], nil

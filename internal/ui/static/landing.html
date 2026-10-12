@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>submcp - the single-binary MCP gateway</title>
-<meta name="description" content="submcp is a lightweight MCP gateway: one binary that aggregates your MCP servers into one endpoint. 15 MB Docker image, Postgres-backed config, embedded admin UI.">
+<meta name="description" content="submcp is a lightweight MCP gateway: one binary that aggregates your MCP servers into one endpoint. 11 MB single binary, Postgres-backed config, embedded admin UI.">
 <link rel="stylesheet" href="/assets/landing.css">
 </head>
 <body>
@@ -69,7 +69,7 @@
         <span class="live-label">upstreams</span>
       </div>
       <div class="live-stat">
-        <span class="live-num">15 MB</span>
+        <span class="live-num">11 MB</span>
         <span class="live-label">single binary</span>
       </div>
       <div class="live-stat">
@@ -96,7 +96,7 @@
         <div class="bento-photo" aria-hidden="true"></div>
         <div class="cell-body">
           <h3>One binary, no runtime</h3>
-          <p>A static Go binary with zero dependencies. No Node, no Python, no 1 GB container images. The Docker image is 15 MB.</p>
+          <p>A static Go binary with zero dependencies. No Node, no Python, no 1 GB container images. The Docker image is about 34 MB.</p>
         </div>
       </article>
       <article class="cell cell-b reveal">
@@ -139,7 +139,7 @@
       <li class="stack-card">
         <span class="stack-num" aria-hidden="true">01</span>
         <h3 class="stack-title">Install</h3>
-        <p class="stack-copy">go build -o bin/submcp ./cmd/submcp, or pull the 15 MB Docker image.</p>
+        <p class="stack-copy">Build the binary with go build, or build the Docker image from the repo.</p>
         <code class="stack-code">go build -o bin/submcp ./cmd/submcp</code>
       </li>
       <li class="stack-card">
@@ -169,7 +169,7 @@
   <!-- H. PRICING -->
   <section class="pricing" id="pricing">
     <h2 class="section-title">Hosted, for when you don't want to run it</h2>
-    <p class="section-sub">Self-host for free, or use our hosted gateway: one URL, all your MCP servers, 14-day free trial.</p>
+    <p class="section-sub">Self-host for free, or use our hosted gateway: one URL for your MCP servers, 14-day free trial, no card needed to start.</p>
     <div class="pricing-grid">
       <div class="tier tier-quiet reveal">
         <span class="tier-label">Self-hosted</span>
@@ -187,10 +187,10 @@
         <div class="tier-price">$12<span class="tier-per">/mo</span></div>
         <div class="tier-period">or $120/yr, 2 months free</div>
         <ul class="tier-list">
-          <li>14-day free trial, card at signup</li>
+          <li>14-day free trial, no card needed to start</li>
           <li>Your own subdomain endpoint</li>
-          <li>Unlimited servers and tools</li>
-          <li>Hosted and monitored 24/7</li>
+          <li>Upstream servers set up for you on request</li>
+          <li>Hosted on our infrastructure, nothing to run</li>
         </ul>
         <a class="btn btn-primary btn-pill" href="/signup">Start free trial</a>
         <p class="tier-note">No free tier after trial. Cancel anytime.</p>
