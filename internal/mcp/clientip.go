@@ -22,6 +22,40 @@ var trustedProxies struct {
 	nets []*net.IPNet
 }
 
+// tenantHostSuffix is ".<TENANT_BASE_HOST>" (for example ".mcp.subimpact.net").
+// Tenant subdomains are DNS-only (not behind Cloudflare), so no CF-Connecting-IP
+// is ever set for them: a value there is a client's own header and is ignored
+// (SaaS 4c, N1). Empty disables the rule.
+var tenantHostSuffix struct {
+	mu     sync.RWMutex
+	suffix string
+}
+
+// SetTenantBaseHost sets the tenant base host (TENANT_BASE_HOST). Call once at
+// startup. Empty leaves every host on the Cloudflare rule.
+func SetTenantBaseHost(base string) {
+	base = strings.ToLower(strings.TrimSpace(base))
+	tenantHostSuffix.mu.Lock()
+	defer tenantHostSuffix.mu.Unlock()
+	if base == "" {
+		tenantHostSuffix.suffix = ""
+		return
+	}
+	tenantHostSuffix.suffix = "." + strings.TrimPrefix(base, ".")
+}
+
+// isTenantHost reports whether the request Host names a tenant subdomain.
+func isTenantHost(host string) bool {
+	h := strings.ToLower(host)
+	if i := strings.LastIndex(h, ":"); i >= 0 && !strings.Contains(h[i:], "]") {
+		h = h[:i]
+	}
+	h = strings.TrimSuffix(h, ".")
+	tenantHostSuffix.mu.RLock()
+	defer tenantHostSuffix.mu.RUnlock()
+	return tenantHostSuffix.suffix != "" && strings.HasSuffix(h, tenantHostSuffix.suffix)
+}
+
 // SetTrustedProxies sets the proxy CIDRs whose forwarded headers are honoured.
 // An empty string trusts nothing (the default).
 func SetTrustedProxies(cidrs string) error {
@@ -77,8 +111,10 @@ func ClientIP(r *http.Request) string {
 	if peer == nil || !isTrustedProxy(peer) {
 		return peerStr
 	}
-	if cf := strings.TrimSpace(r.Header.Get("CF-Connecting-IP")); net.ParseIP(cf) != nil {
-		return cf
+	if !isTenantHost(r.Host) {
+		if cf := strings.TrimSpace(r.Header.Get("CF-Connecting-IP")); net.ParseIP(cf) != nil {
+			return cf
+		}
 	}
 	if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
 		parts := strings.Split(xff, ",")

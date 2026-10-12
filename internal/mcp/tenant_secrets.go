@@ -11,7 +11,7 @@ import (
 	"strings"
 )
 
-// Tenant credential storage (SaaS phase 4, format v2).
+// Tenant credential storage (SaaS phase 4, format v2; SaaS 4c dual-read).
 //
 // Header values on tenant-managed servers are sealed with AES-256-GCM under
 // TENANT_SECRET_KEY (32 bytes: `openssl rand -base64 32`). A sealed value is
@@ -21,8 +21,12 @@ import (
 //	owner user id | server uuid | header name
 //
 // so a value copied to another header, another server or another owner fails
-// to authenticate. The v1 format ("enc:v1:", header name only) is not accepted
-// at run time; ResealLegacyTenantHeaders rewrites every v1 value to v2 at boot.
+// to authenticate.
+//
+// Reads accept both v2 and the v1 format ("enc:v1:", header name only), so a
+// row written by an older image still opens during a blue/green overlap or
+// after a rollback. Every write is v2, and ResealLegacyTenantHeaders rewrites
+// the v1 rows at boot. The v1 binding is weaker, so v1 is a read-only fallback.
 // Losing TENANT_SECRET_KEY makes every stored tenant credential unrecoverable,
 // so the key must be backed up next to the database.
 
@@ -142,9 +146,22 @@ func IsMaskedValue(v string) bool {
 	return strings.HasPrefix(v, maskPrefix)
 }
 
+// openStoredValue opens one stored header value in either format. v2 binds the
+// owner, the server and the header name; v1 binds the header name only.
+func openStoredValue(box *SecretBox, v, owner, serverUUID, name string) (string, error) {
+	switch {
+	case strings.HasPrefix(v, sealPrefix):
+		return openWith(box, v[len(sealPrefix):], tenantHeaderAAD(owner, serverUUID, name))
+	case strings.HasPrefix(v, legacySealPrefix):
+		return openWith(box, v[len(legacySealPrefix):], name)
+	default:
+		return "", errors.New("value is not sealed")
+	}
+}
+
 // OpenSealedHeaders decrypts a tenant header map for one server. Every value
-// must be sealed in the current format and bound to (owner, serverUUID); a
-// plaintext or legacy value is refused (fail closed).
+// must be sealed (v2, or the v1 read-only fallback) and must open under the
+// key; a plaintext value is refused (fail closed).
 func OpenSealedHeaders(raw json.RawMessage, box *SecretBox, owner, serverUUID string) (map[string]string, error) {
 	out := map[string]string{}
 	if len(raw) == 0 {
@@ -158,13 +175,10 @@ func OpenSealedHeaders(raw json.RawMessage, box *SecretBox, owner, serverUUID st
 		if !IsSealed(v) {
 			return nil, errors.New("a stored tenant credential is not encrypted; refusing to use it")
 		}
-		if strings.HasPrefix(v, legacySealPrefix) {
-			return nil, errors.New("a stored tenant credential uses the legacy format and has not been re-sealed")
-		}
 		if box == nil {
 			return nil, ErrNoSecretKey
 		}
-		plain, err := box.Open(v, tenantHeaderAAD(owner, serverUUID, k))
+		plain, err := openStoredValue(box, v, owner, serverUUID, k)
 		if err != nil {
 			return nil, errors.New("a stored tenant credential could not be decrypted")
 		}
@@ -207,10 +221,10 @@ func MaskHeaders(raw json.RawMessage, box *SecretBox, owner, serverUUID string) 
 		switch {
 		case !IsSealed(v):
 			out[k] = MaskSecret(v)
-		case box == nil || strings.HasPrefix(v, legacySealPrefix):
+		case box == nil:
 			out[k] = maskPrefix
 		default:
-			if plain, err := box.Open(v, tenantHeaderAAD(owner, serverUUID, k)); err == nil {
+			if plain, err := openStoredValue(box, v, owner, serverUUID, k); err == nil {
 				out[k] = MaskSecret(plain)
 			} else {
 				out[k] = maskPrefix

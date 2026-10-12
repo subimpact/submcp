@@ -17,7 +17,7 @@ import (
 // LegacyHeaderStore is the DB surface the re-seal needs (*db.Pool implements it).
 type LegacyHeaderStore interface {
 	ListLegacyTenantHeaders(ctx context.Context) ([]db.TenantHeaderRow, error)
-	SetTenantHeaders(ctx context.Context, serverUUID string, headers json.RawMessage) error
+	SetTenantHeaders(ctx context.Context, serverUUID string, expected, headers json.RawMessage) error
 }
 
 // ResealLegacyTenantHeaders rewrites every v1 tenant header value to v2 and
@@ -65,7 +65,9 @@ func ResealLegacyTenantHeaders(ctx context.Context, store LegacyHeaderStore, box
 		if err != nil {
 			return done, err
 		}
-		if err := store.SetTenantHeaders(ctx, row.ServerUUID, raw); err != nil {
+		// Compare-and-set on the row as it was read: a concurrent write stops the
+		// boot instead of being overwritten (SaaS 4c, N5).
+		if err := store.SetTenantHeaders(ctx, row.ServerUUID, row.Headers, raw); err != nil {
 			return done, fmt.Errorf("server %s: write re-sealed credentials: %w", row.ServerUUID, err)
 		}
 		done++

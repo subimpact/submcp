@@ -114,7 +114,7 @@ func TestIntegrationLegacyHeaderScanAndRewrite(t *testing.T) {
 	if !found {
 		t.Fatal("the legacy row was not listed")
 	}
-	if err := p.SetTenantHeaders(ctx, srv.UUID, json.RawMessage(`{"Authorization":"enc:v2:BBBB"}`)); err != nil {
+	if err := p.SetTenantHeaders(ctx, srv.UUID, json.RawMessage(`{"Authorization":"enc:v1:AAAA"}`), json.RawMessage(`{"Authorization":"enc:v2:BBBB"}`)); err != nil {
 		t.Fatal(err)
 	}
 	rows, err = p.ListLegacyTenantHeaders(ctx)

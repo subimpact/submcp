@@ -162,10 +162,10 @@ func TestIntegrationTenantServerLifecycle(t *testing.T) {
 
 	// Update: owner only; a change clears the check and the quarantine.
 	first.Name = "alpha-renamed"
-	if ok, err := p.UpdateTenantServer(ctx, other, first); err != nil || ok {
+	if ok, err := p.UpdateTenantServer(ctx, other, first, first.Headers); err != nil || ok {
 		t.Fatalf("other tenant updated the server: %v %v", ok, err)
 	}
-	if ok, err := p.UpdateTenantServer(ctx, uid, first); err != nil || !ok {
+	if ok, err := p.UpdateTenantServer(ctx, uid, first, first.Headers); err != nil || !ok {
 		t.Fatalf("owner update: %v %v", ok, err)
 	}
 	if got, _ := p.GetServer(ctx, first.UUID, &uid); got.Name != "alpha-renamed" || got.LastCheckedAt != nil {
@@ -294,7 +294,7 @@ func TestIntegrationTenantAPIIgnoresLegacyRows(t *testing.T) {
 
 	hijack := "https://hijack.example-zone.net/mcp"
 	ok, err := p.UpdateTenantServer(ctx, uid, &MCPServer{UUID: legacyID, Name: "opsrv", Type: ServerTypeStreamableHTTP,
-		URL: &hijack, Headers: []byte(`{}`)})
+		URL: &hijack, Headers: []byte(`{}`)}, nil)
 	if err != nil || ok {
 		t.Fatalf("tenant API rewrote a legacy row: updated=%v err=%v", ok, err)
 	}

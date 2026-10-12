@@ -148,21 +148,41 @@ func (p *Pool) CreateTenantServer(ctx context.Context, userID, nsUUID string, s 
 
 // UpdateTenantServer rewrites a tenant server's editable fields. It clears the
 // last check result and quarantine, since the upstream it describes changed.
-// Returns false when the server does not belong to userID.
-func (p *Pool) UpdateTenantServer(ctx context.Context, userID string, s *MCPServer) (bool, error) {
+// Returns false when the server does not belong to userID. The headers are
+// written only while the row still holds expectedHeaders (compare-and-set): a
+// PATCH that read the row before another write must not revert that write. A
+// conflict returns ErrTenantHeadersChanged (SaaS 4c, N5).
+func (p *Pool) UpdateTenantServer(ctx context.Context, userID string, s *MCPServer, expectedHeaders json.RawMessage) (bool, error) {
+	if len(expectedHeaders) == 0 {
+		expectedHeaders = json.RawMessage(`{}`)
+	}
 	tag, err := p.Exec(ctx, `
 		UPDATE mcp_servers SET name = $3, type = $4, url = $5, headers = $6,
 		       tenant_managed = true, error_status = 'NONE',
 		       last_error = NULL, last_checked_at = NULL
-		WHERE uuid = $1 AND user_id = $2 AND tenant_managed = true`,
-		s.UUID, userID, s.Name, s.Type, s.URL, s.Headers)
+		WHERE uuid = $1 AND user_id = $2 AND tenant_managed = true
+		  AND headers IS NOT DISTINCT FROM $7`,
+		s.UUID, userID, s.Name, s.Type, s.URL, s.Headers, expectedHeaders)
 	if err != nil {
 		if isUniqueViolation(err) {
 			return false, ErrTenantNameTaken
 		}
 		return false, err
 	}
-	return tag.RowsAffected() > 0, nil
+	if tag.RowsAffected() > 0 {
+		return true, nil
+	}
+	var owned bool
+	if err := p.QueryRow(ctx, `
+		SELECT EXISTS (SELECT 1 FROM mcp_servers
+		               WHERE uuid = $1 AND user_id = $2 AND tenant_managed = true)`,
+		s.UUID, userID).Scan(&owned); err != nil {
+		return false, err
+	}
+	if owned {
+		return false, ErrTenantHeadersChanged
+	}
+	return false, nil
 }
 
 // DeleteTenantServer removes a tenant server; mappings and tools cascade.
@@ -209,13 +229,41 @@ func (p *Pool) ListLegacyTenantHeaders(ctx context.Context) ([]TenantHeaderRow, 
 	return out, rows.Err()
 }
 
-// SetTenantHeaders replaces the stored header JSON of one tenant row.
-func (p *Pool) SetTenantHeaders(ctx context.Context, serverUUID string, headers json.RawMessage) error {
-	_, err := p.Exec(ctx, `
+// ErrTenantHeadersChanged means the stored headers differ from the value the
+// writer read: another write landed first (a compare-and-set failed).
+var ErrTenantHeadersChanged = errors.New("tenant server headers changed concurrently")
+
+// SetTenantHeaders replaces the stored header JSON of one tenant row, only while
+// the row still holds expected (compare-and-set, SaaS 4c N5). A conflict returns
+// ErrTenantHeadersChanged; a missing tenant row returns ErrTenantServerNotFound.
+func (p *Pool) SetTenantHeaders(ctx context.Context, serverUUID string, expected, headers json.RawMessage) error {
+	if len(expected) == 0 {
+		expected = json.RawMessage(`{}`)
+	}
+	tag, err := p.Exec(ctx, `
 		UPDATE mcp_servers SET headers = $2
-		WHERE uuid = $1 AND tenant_managed = true`, serverUUID, headers)
-	return err
+		WHERE uuid = $1 AND tenant_managed = true AND headers IS NOT DISTINCT FROM $3`,
+		serverUUID, headers, expected)
+	if err != nil {
+		return err
+	}
+	if tag.RowsAffected() > 0 {
+		return nil
+	}
+	var exists bool
+	if err := p.QueryRow(ctx, `
+		SELECT EXISTS (SELECT 1 FROM mcp_servers WHERE uuid = $1 AND tenant_managed = true)`,
+		serverUUID).Scan(&exists); err != nil {
+		return err
+	}
+	if exists {
+		return ErrTenantHeadersChanged
+	}
+	return ErrTenantServerNotFound
 }
+
+// ErrTenantServerNotFound means no tenant-managed row has the given uuid.
+var ErrTenantServerNotFound = errors.New("tenant server not found")
 
 // ListTenantTools returns the owner's discovered tools with their status in
 // nsUUID. An empty nsUUID means no mapping lookup (every tool reads ACTIVE).

@@ -53,7 +53,7 @@ type TenantServerStore interface {
 	TenantNamespaceUUID(ctx context.Context, userID string) (string, error)
 	ListTenantServers(ctx context.Context, userID string) ([]db.TenantServerRow, error)
 	CreateTenantServer(ctx context.Context, userID, nsUUID string, s *db.MCPServer, maxServers int) error
-	UpdateTenantServer(ctx context.Context, userID string, s *db.MCPServer) (bool, error)
+	UpdateTenantServer(ctx context.Context, userID string, s *db.MCPServer, expectedHeaders json.RawMessage) (bool, error)
 	DeleteTenantServer(ctx context.Context, userID, serverUUID string) (bool, error)
 	ListTenantTools(ctx context.Context, userID, nsUUID string) ([]db.TenantToolRow, error)
 	GetTenantTool(ctx context.Context, userID, toolUUID, nsUUID string) (*db.TenantToolRow, error)
@@ -496,10 +496,13 @@ func (t *tenantAPI) updateServer(w http.ResponseWriter, r *http.Request) {
 		next.Headers = sealed
 	}
 
-	updated, err := t.store.UpdateTenantServer(r.Context(), c.UserID, &next)
+	updated, err := t.store.UpdateTenantServer(r.Context(), c.UserID, &next, cur.Headers)
 	switch {
 	case errors.Is(err, db.ErrTenantNameTaken):
 		writeJSONError(w, http.StatusConflict, "name_taken", "You already have a server with this name.")
+		return
+	case errors.Is(err, db.ErrTenantHeadersChanged):
+		writeJSONError(w, http.StatusConflict, "conflict", "This server was changed by another request. Reload it and try again.")
 		return
 	case err != nil:
 		writeJSONError(w, http.StatusInternalServerError, "internal_error", "Database error")

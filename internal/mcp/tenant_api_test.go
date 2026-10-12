@@ -11,6 +11,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
 	"sort"
 	"strings"
 	"sync"
@@ -48,6 +49,10 @@ type fakeTenantDB struct {
 	seq         int
 	bumps       int  // TryBumpUsage calls (trial cap accounting)
 	usageDenied bool // TryBumpUsage refuses when set
+	// beforeUpdate, when set, runs before UpdateTenantServer compares headers. A
+	// test uses it to land a concurrent write between the handler's read and its
+	// write (SaaS 4c, N5).
+	beforeUpdate func()
 }
 
 func newFakeTenantDB() *fakeTenantDB {
@@ -213,12 +218,19 @@ func (f *fakeTenantDB) CreateTenantServer(_ context.Context, uid, ns string, s *
 	return nil
 }
 
-func (f *fakeTenantDB) UpdateTenantServer(_ context.Context, uid string, s *db.MCPServer) (bool, error) {
+func (f *fakeTenantDB) UpdateTenantServer(_ context.Context, uid string, s *db.MCPServer, expectedHeaders json.RawMessage) (bool, error) {
+	if f.beforeUpdate != nil {
+		f.beforeUpdate()
+	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	cur, ok := f.servers[s.UUID]
 	if !ok || !f.ownedBy(cur, uid) {
 		return false, nil
+	}
+	// Compare-and-set on the headers, as the database does.
+	if !jsonEqual(cur.Headers, expectedHeaders) {
+		return false, db.ErrTenantHeadersChanged
 	}
 	for _, id := range f.order {
 		o := f.servers[id]
@@ -1318,4 +1330,20 @@ func TestTenantAPIIgnoresLegacyRowsEvenForTheOwnersKey(t *testing.T) {
 	if rr := fx.api(keyOpNon, "POST", "/api/tenant/servers", map[string]any{"name": "fresh", "url": "https://" + fxUpstreamHost + "/mcp"}); rr.Code != http.StatusCreated {
 		t.Fatalf("legacy row counted against the quota: %d %s", rr.Code, rr.Body.String())
 	}
+}
+
+// jsonEqual compares two JSON documents semantically (key order and spacing do
+// not matter), as a jsonb comparison does. A missing document equals "{}".
+func jsonEqual(a, b json.RawMessage) bool {
+	norm := func(x json.RawMessage) any {
+		if len(x) == 0 {
+			x = json.RawMessage(`{}`)
+		}
+		var v any
+		if err := json.Unmarshal(x, &v); err != nil {
+			return string(x)
+		}
+		return v
+	}
+	return reflect.DeepEqual(norm(a), norm(b))
 }

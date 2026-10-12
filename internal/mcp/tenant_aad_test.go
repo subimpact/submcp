@@ -46,19 +46,31 @@ func TestAADRefusesCiphertextMovedToAnotherServer(t *testing.T) {
 	}
 }
 
-// Legacy (v1, header-name-only) values are refused at run time and re-sealed at boot.
-func TestLegacyCiphertextIsRefusedAtRunTime(t *testing.T) {
+// Legacy (v1, header-name-only) values open at run time (SaaS 4c, N5: dual-read,
+// so a row written by an older image still works in a blue/green overlap or
+// after a rollback). The v1 binding covers the header name only, so a v1 value
+// moved to another header is still refused. Every write is v2, and the boot
+// re-seal rewrites the v1 rows.
+func TestLegacyCiphertextOpensAtRunTime(t *testing.T) {
 	box := testBox(t)
 	v1, err := sealWith(box, legacySealPrefix, "Bearer legacy-9999", "Authorization")
 	if err != nil {
 		t.Fatal(err)
 	}
 	raw, _ := json.Marshal(map[string]string{"Authorization": v1})
-	if _, err := OpenSealedHeaders(raw, box, testOwner, testServerUUID); err == nil {
-		t.Fatal("a v1 value must not be used at run time")
+	got, err := OpenSealedHeaders(raw, box, testOwner, testServerUUID)
+	if err != nil {
+		t.Fatalf("a v1 value must open at run time: %v", err)
 	}
-	if got := MaskHeaders(raw, box, testOwner, testServerUUID)["Authorization"]; strings.Contains(got, "9999") {
-		t.Fatalf("a v1 value must not show even its tail: %q", got)
+	if got["Authorization"] != "Bearer legacy-9999" {
+		t.Fatalf("v1 opened to %q", got["Authorization"])
+	}
+	if masked := MaskHeaders(raw, box, testOwner, testServerUUID)["Authorization"]; masked != maskPrefix+"9999" {
+		t.Fatalf("a v1 value must show the mask and its last four characters, got %q", masked)
+	}
+	moved, _ := json.Marshal(map[string]string{"X-Api-Key": v1})
+	if _, err := OpenSealedHeaders(moved, box, testOwner, testServerUUID); err == nil {
+		t.Fatal("a v1 value moved to another header name must not open")
 	}
 }
 
@@ -81,7 +93,21 @@ func (f *fakeLegacyStore) ListLegacyTenantHeaders(context.Context) ([]db.TenantH
 	return out, nil
 }
 
-func (f *fakeLegacyStore) SetTenantHeaders(_ context.Context, uuid string, headers json.RawMessage) error {
+func (f *fakeLegacyStore) SetTenantHeaders(_ context.Context, uuid string, expected, headers json.RawMessage) error {
+	cur, ok := f.set[uuid]
+	if !ok {
+		for _, r := range f.rows {
+			if r.ServerUUID == uuid {
+				cur, ok = r.Headers, true
+			}
+		}
+	}
+	if !ok {
+		return db.ErrTenantServerNotFound
+	}
+	if !jsonEqual(cur, expected) {
+		return db.ErrTenantHeadersChanged
+	}
 	f.set[uuid] = headers
 	return nil
 }

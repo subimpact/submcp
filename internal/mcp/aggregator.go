@@ -429,6 +429,9 @@ func (a *Aggregator) CallTool(ctx context.Context, namespaceUUID, sessionID, too
 
 	client, err := a.acquire(ctx, *target, sessionID, poolKey, cfg)
 	if err != nil {
+		if clientGone(ctx) {
+			return nil, fmt.Errorf("acquire upstream %s: %w", target.Name, err)
+		}
 		if b.Failure() {
 			a.quarantine(ctx, *target)
 		}
@@ -441,6 +444,9 @@ func (a *Aggregator) CallTool(ctx context.Context, namespaceUUID, sessionID, too
 
 	res, err := client.CallTool(ctx, dispatchName, args)
 	if err != nil {
+		if clientGone(ctx) {
+			return nil, err
+		}
 		if b.Failure() {
 			a.quarantine(ctx, *target)
 		}
@@ -558,6 +564,9 @@ func (a *Aggregator) fetchServerTools(ctx context.Context, s db.MCPServer, overr
 	sessionID := "list-" + s.UUID
 	client, err := a.acquire(ctx, s, sessionID, poolKey, cfg)
 	if err != nil {
+		if clientGone(ctx) {
+			return nil, redactError(err, secretsFor(s, cfg))
+		}
 		if b.Failure() {
 			a.quarantine(ctx, s)
 		}
@@ -568,6 +577,9 @@ func (a *Aggregator) fetchServerTools(ctx context.Context, s db.MCPServer, overr
 
 	tools, err := client.ListTools(ctx)
 	if err != nil {
+		if clientGone(ctx) {
+			return nil, redactError(err, secretsFor(s, cfg))
+		}
 		if b.Failure() {
 			a.quarantine(ctx, s)
 		}
@@ -585,12 +597,29 @@ func (a *Aggregator) fetchServerTools(ctx context.Context, s db.MCPServer, overr
 	return tools, nil
 }
 
+// bookkeepingTimeout bounds the writes that record an upstream outcome.
+const bookkeepingTimeout = 3 * time.Second
+
+// bookkeepingCtx returns the context for the bookkeeping writes. It survives the
+// request's own deadline (a timeout is an upstream failure worth recording) but
+// not the client's cancellation, and it has its own bound (SaaS 4c, N7).
+func bookkeepingCtx(ctx context.Context) (context.Context, context.CancelFunc) {
+	return context.WithTimeout(context.WithoutCancel(ctx), bookkeepingTimeout)
+}
+
+// clientGone reports whether a request ended because the client went away.
+// That is not an upstream failure: it does not count against the circuit
+// breaker and is not recorded on the server (SaaS 4c, N7).
+func clientGone(ctx context.Context) bool {
+	return errors.Is(ctx.Err(), context.Canceled)
+}
+
 // quarantine marks a server ERROR in the DB (removes it from the active
 // fan-out). Non-fatal: DB errors are logged, the breaker still protects.
 func (a *Aggregator) quarantine(ctx context.Context, s db.MCPServer) {
-	// Bookkeeping must survive the request deadline that caused the failure.
-	ctx = context.WithoutCancel(ctx)
-	if err := a.db.SetServerErrorStatus(ctx, s.UUID, db.ErrorStatusErr); err != nil {
+	bctx, cancel := bookkeepingCtx(ctx)
+	defer cancel()
+	if err := a.db.SetServerErrorStatus(bctx, s.UUID, db.ErrorStatusErr); err != nil {
 		slog.Warn("quarantine write failed", "server", s.Name, "err", err)
 		return
 	}
@@ -599,7 +628,9 @@ func (a *Aggregator) quarantine(ctx context.Context, s db.MCPServer) {
 
 // unquarantine resets a server's error_status to NONE after recovery.
 func (a *Aggregator) unquarantine(ctx context.Context, s db.MCPServer) {
-	if err := a.db.SetServerErrorStatus(ctx, s.UUID, db.ErrorStatusNone); err != nil {
+	bctx, cancel := bookkeepingCtx(ctx)
+	defer cancel()
+	if err := a.db.SetServerErrorStatus(bctx, s.UUID, db.ErrorStatusNone); err != nil {
 		slog.Warn("unquarantine write failed", "server", s.Name, "err", err)
 	}
 }
@@ -687,9 +718,14 @@ func (a *Aggregator) buildRouteMap(ctx context.Context, namespaceUUID string, se
 	}
 	wg.Wait()
 
-	a.routeMu.Lock()
-	a.routes[namespaceUUID] = &nsRoute{routeMap: routeMap, at: time.Now()}
-	a.routeMu.Unlock()
+	// A partial map (any server errored) is not cached: caching it would hide
+	// that server's tools for the whole TTL (SaaS 4c, N9). Healthy servers keep
+	// their own per-server tool cache, so a rebuild is cheap.
+	if len(errs) == 0 {
+		a.routeMu.Lock()
+		a.routes[namespaceUUID] = &nsRoute{routeMap: routeMap, at: time.Now()}
+		a.routeMu.Unlock()
+	}
 
 	if len(routeMap) == 0 && len(errs) > 0 {
 		return nil, fmt.Errorf("all upstreams failed: %s", strings.Join(errs, "; "))
@@ -909,8 +945,14 @@ func (a *Aggregator) recordCheck(ctx context.Context, s db.MCPServer, headers ma
 	if !s.TenantManaged {
 		return
 	}
-	// The result must be stored even when the request deadline has passed.
-	ctx = context.WithoutCancel(ctx)
+	// The result must be stored even when the request deadline has passed, but
+	// not when the client cancelled (that is not an outcome of the upstream).
+	if clientGone(ctx) {
+		return
+	}
+	bctx, cancel := bookkeepingCtx(ctx)
+	defer cancel()
+	ctx = bctx
 	cs, ok := a.db.(serverCheckStore)
 	if !ok {
 		return
