@@ -147,7 +147,14 @@ func (f *fakeTenantDB) TenantNamespaceUUID(_ context.Context, uid string) (strin
 	return "", nil
 }
 
+// ownedBy mirrors the SQL scope: owner match AND tenant_managed. Legacy rows
+// are never visible or writable through the tenant API.
 func (f *fakeTenantDB) ownedBy(s *db.MCPServer, uid string) bool {
+	return s.UserID != nil && *s.UserID == uid && s.TenantManaged
+}
+
+// ownedAny is the owner match alone (the name uniqueness index covers every row).
+func (f *fakeTenantDB) ownedAny(s *db.MCPServer, uid string) bool {
 	return s.UserID != nil && *s.UserID == uid
 }
 
@@ -170,11 +177,11 @@ func (f *fakeTenantDB) CreateTenantServer(_ context.Context, uid, ns string, s *
 	owned := 0
 	for _, id := range f.order {
 		o := f.servers[id]
+		if f.ownedAny(o, uid) && o.Name == s.Name {
+			return db.ErrTenantNameTaken
+		}
 		if f.ownedBy(o, uid) {
 			owned++
-			if o.Name == s.Name {
-				return db.ErrTenantNameTaken
-			}
 		}
 	}
 	if owned >= max {
@@ -201,7 +208,7 @@ func (f *fakeTenantDB) UpdateTenantServer(_ context.Context, uid string, s *db.M
 	}
 	for _, id := range f.order {
 		o := f.servers[id]
-		if id != s.UUID && f.ownedBy(o, uid) && o.Name == s.Name {
+		if id != s.UUID && f.ownedAny(o, uid) && o.Name == s.Name {
 			return false, db.ErrTenantNameTaken
 		}
 	}
@@ -1182,5 +1189,49 @@ func TestTenantAPIDisabledWithoutServiceTokenStaysOff(t *testing.T) {
 	short := &Server{tenants: &tenantGate{}, agg: fx.srv.agg}
 	if err := short.EnableTenantAPI(fx.db, TenantAPIConfig{ServiceToken: "too-short"}); err == nil {
 		t.Fatal("a short service token must be refused")
+	}
+}
+
+// The operator's non-admin key is bound to the operator user, which also owns
+// the operator's legacy rows. Through the tenant API that key must see none of
+// them, and must not be able to change, delete, test or convert them.
+func TestTenantAPIIgnoresLegacyRowsEvenForTheOwnersKey(t *testing.T) {
+	fx, _, _, _, _ := standardFixture(t, 2)
+	opID := ""
+	for _, id := range fx.db.order {
+		if fx.db.servers[id].Name == "opsrv" {
+			opID = id
+		}
+	}
+	if opID == "" {
+		t.Fatal("fixture lacks the operator row")
+	}
+	before := *fx.db.servers[opID]
+
+	for _, s := range decode(t, fx.api(keyOpNon, "GET", "/api/tenant/servers", nil))["servers"].([]any) {
+		if s.(map[string]any)["name"] == "opsrv" {
+			t.Fatal("the owner's tenant key lists a legacy row")
+		}
+	}
+	if rr := fx.api(keyOpNon, "PATCH", "/api/tenant/servers/"+opID, map[string]any{"url": "https://" + fxUpstreamHost + "/x"}); rr.Code != http.StatusNotFound {
+		t.Fatalf("PATCH legacy row = %d, want 404", rr.Code)
+	}
+	if rr := fx.api(keyOpNon, "DELETE", "/api/tenant/servers/"+opID, nil); rr.Code != http.StatusNotFound {
+		t.Fatalf("DELETE legacy row = %d, want 404", rr.Code)
+	}
+	if rr := fx.api(keyOpNon, "POST", "/api/tenant/servers/"+opID+"/test", nil); rr.Code != http.StatusNotFound {
+		t.Fatalf("test legacy row = %d, want 404", rr.Code)
+	}
+	after := fx.db.servers[opID]
+	if after.TenantManaged != before.TenantManaged || deref(after.URL) != deref(before.URL) || after.Name != before.Name {
+		t.Fatalf("legacy row changed through the tenant API: %+v", after)
+	}
+	// A name clash with a legacy row is refused, as the unique index would.
+	if rr := fx.api(keyOpNon, "POST", "/api/tenant/servers", map[string]any{"name": "opsrv", "url": "https://" + fxUpstreamHost + "/mcp"}); rr.Code != http.StatusConflict {
+		t.Fatalf("name clash with a legacy row = %d, want 409", rr.Code)
+	}
+	// Legacy rows do not use up the owner's tenant quota (fixture limit: 2).
+	if rr := fx.api(keyOpNon, "POST", "/api/tenant/servers", map[string]any{"name": "fresh", "url": "https://" + fxUpstreamHost + "/mcp"}); rr.Code != http.StatusCreated {
+		t.Fatalf("legacy row counted against the quota: %d %s", rr.Code, rr.Body.String())
 	}
 }

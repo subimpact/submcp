@@ -258,3 +258,56 @@ func TestIntegrationBackfillLeavesOtherStatusesAlone(t *testing.T) {
 		t.Fatalf("status changed to %s", tn.Status)
 	}
 }
+
+// A legacy (operator-style) upstream can share an owner with a tenant API key:
+// the operator's own non-admin keys are bound to the operator user, and so are
+// the operator's rows. The tenant API must not list, change, delete or test
+// such a row, or a non-admin key could turn an operator upstream into a tenant
+// row (which changes its network policy and breaks it).
+func TestIntegrationTenantAPIIgnoresLegacyRows(t *testing.T) {
+	p := integrationPool(t)
+	ctx := context.Background()
+	uid, ns := seedTenant(t, p, "legacy", "active", nil)
+
+	legacyURL := "https://legacy.example-zone.net/mcp"
+	var legacyID string
+	if err := p.QueryRow(ctx, `
+		INSERT INTO mcp_servers (name, type, url, headers, user_id)
+		VALUES ('opsrv', 'STREAMABLE_HTTP', $1, '{"Authorization":"Bearer legacy-plain-1234"}', $2)
+		RETURNING uuid::text`, legacyURL, uid).Scan(&legacyID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := p.Exec(ctx, `INSERT INTO namespace_server_mappings (namespace_uuid, mcp_server_uuid, status)
+		VALUES ($1, $2, 'ACTIVE')`, ns, legacyID); err != nil {
+		t.Fatal(err)
+	}
+
+	rows, err := p.ListTenantServers(ctx, uid)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, r := range rows {
+		if r.Server.UUID == legacyID {
+			t.Fatal("tenant API lists a legacy row")
+		}
+	}
+
+	hijack := "https://hijack.example-zone.net/mcp"
+	ok, err := p.UpdateTenantServer(ctx, uid, &MCPServer{UUID: legacyID, Name: "opsrv", Type: ServerTypeStreamableHTTP,
+		URL: &hijack, Headers: []byte(`{}`)})
+	if err != nil || ok {
+		t.Fatalf("tenant API rewrote a legacy row: updated=%v err=%v", ok, err)
+	}
+	if deleted, _ := p.DeleteTenantServer(ctx, uid, legacyID); deleted {
+		t.Fatal("tenant API deleted a legacy row")
+	}
+
+	var url string
+	var managed bool
+	if err := p.QueryRow(ctx, `SELECT url, tenant_managed FROM mcp_servers WHERE uuid = $1::uuid`, legacyID).Scan(&url, &managed); err != nil {
+		t.Fatal(err)
+	}
+	if url != legacyURL || managed {
+		t.Fatalf("legacy row changed: url=%s tenant_managed=%v", url, managed)
+	}
+}

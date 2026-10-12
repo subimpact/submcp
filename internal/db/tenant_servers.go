@@ -9,8 +9,11 @@ import (
 )
 
 // Tenant-managed upstreams (SaaS phase 4). Every query is scoped by the
-// owner's user_id. Rows with a NULL owner never match a caller id, so they
-// are invisible to the tenant API by construction.
+// owner's user_id AND tenant_managed = true. Rows with a NULL owner never match
+// a caller id. Legacy rows (tenant_managed = false), including the operator's
+// own rows, are invisible and unwritable here, even to the owner's keys: the
+// operator's non-admin keys are bound to the operator user, and this stops them
+// from converting an operator upstream into a tenant row.
 
 // ErrTenantServerLimit means the tenant already has the maximum number of
 // servers.
@@ -64,7 +67,7 @@ func (p *Pool) ListTenantServers(ctx context.Context, userID string) ([]TenantSe
 		       s.tenant_managed, s.last_error, s.last_checked_at,
 		       (SELECT count(*) FROM tools t WHERE t.mcp_server_uuid = s.uuid)
 		FROM mcp_servers s
-		WHERE s.user_id = $1
+		WHERE s.user_id = $1 AND s.tenant_managed = true
 		ORDER BY s.created_at ASC`, userID)
 	if err != nil {
 		return nil, err
@@ -100,7 +103,7 @@ func (p *Pool) CreateTenantServer(ctx context.Context, userID, nsUUID string, s 
 		return err
 	}
 	var n int
-	if err := tx.QueryRow(ctx, `SELECT count(*) FROM mcp_servers WHERE user_id = $1`, userID).Scan(&n); err != nil {
+	if err := tx.QueryRow(ctx, `SELECT count(*) FROM mcp_servers WHERE user_id = $1 AND tenant_managed = true`, userID).Scan(&n); err != nil {
 		return err
 	}
 	if n >= maxServers {
@@ -140,7 +143,7 @@ func (p *Pool) UpdateTenantServer(ctx context.Context, userID string, s *MCPServ
 		UPDATE mcp_servers SET name = $3, type = $4, url = $5, headers = $6,
 		       tenant_managed = true, error_status = 'NONE',
 		       last_error = NULL, last_checked_at = NULL
-		WHERE uuid = $1 AND user_id = $2`,
+		WHERE uuid = $1 AND user_id = $2 AND tenant_managed = true`,
 		s.UUID, userID, s.Name, s.Type, s.URL, s.Headers)
 	if err != nil {
 		if isUniqueViolation(err) {
@@ -154,7 +157,7 @@ func (p *Pool) UpdateTenantServer(ctx context.Context, userID string, s *MCPServ
 // DeleteTenantServer removes a tenant server; mappings and tools cascade.
 // Returns false when the server does not belong to userID.
 func (p *Pool) DeleteTenantServer(ctx context.Context, userID, serverUUID string) (bool, error) {
-	tag, err := p.Exec(ctx, `DELETE FROM mcp_servers WHERE uuid = $1 AND user_id = $2`, serverUUID, userID)
+	tag, err := p.Exec(ctx, `DELETE FROM mcp_servers WHERE uuid = $1 AND user_id = $2 AND tenant_managed = true`, serverUUID, userID)
 	if err != nil {
 		return false, err
 	}
@@ -184,7 +187,7 @@ func (p *Pool) ListTenantTools(ctx context.Context, userID, nsUUID string) ([]Te
 		JOIN mcp_servers s ON s.uuid = t.mcp_server_uuid
 		LEFT JOIN namespace_tool_mappings m
 		       ON m.tool_uuid = t.uuid AND m.namespace_uuid = $2::uuid
-		WHERE s.user_id = $1
+		WHERE s.user_id = $1 AND s.tenant_managed = true
 		ORDER BY s.name, t.name`, userID, ns)
 	if err != nil {
 		return nil, err
@@ -219,7 +222,7 @@ func (p *Pool) GetTenantTool(ctx context.Context, userID, toolUUID, nsUUID strin
 		JOIN mcp_servers s ON s.uuid = t.mcp_server_uuid
 		LEFT JOIN namespace_tool_mappings m
 		       ON m.tool_uuid = t.uuid AND m.namespace_uuid = $3::uuid
-		WHERE s.user_id = $1 AND t.uuid = $2::uuid`, userID, toolUUID, ns).Scan(
+		WHERE s.user_id = $1 AND t.uuid = $2::uuid AND s.tenant_managed = true`, userID, toolUUID, ns).Scan(
 		&r.ToolUUID, &r.ToolName, &r.Description, &r.ServerUUID, &r.ServerName, &status)
 	if err == pgx.ErrNoRows {
 		return nil, nil
