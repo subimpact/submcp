@@ -370,7 +370,16 @@ for i in $(seq 1 30); do
   [ "$i" = 30 ] && { echo "ERROR: prod never healthy" >&2; exit 1; }
   sleep 1
 done
-curl -sf -o /dev/null -m 8 -A "Mozilla/5.0 (X11; Linux x86_64) submcp-deploy" https://mcp.subimpact.net/health && echo "    public OK"
+# Traefik routes to the renamed container a few seconds after the switch: retry
+# the public checks (pitfalls 1 and 21) instead of treating the first miss as a failure.
+for i in $(seq 1 30); do
+  if curl -sf -o /dev/null -m 8 -A "Mozilla/5.0 (X11; Linux x86_64) submcp-deploy" https://mcp.subimpact.net/health; then
+    echo "    public OK (${i}s)"
+    break
+  fi
+  [ "$i" = 30 ] && echo "WARN: public health not answering after 30s; check Traefik" >&2
+  sleep 1
+done
 curl -sf -o /dev/null -m 8 https://vmi3274017-vps.tailab0a04.ts.net:12008/health && echo "    tailscale OK"
 # Tenant wildcard: the cert may still be issuing (DNS-01 takes a minute or
 # two). Warn, do not fail; re-check with a strict curl once it settles.
@@ -381,8 +390,13 @@ echo "==> [7/7] origin guard (N1): a direct request from a non-Cloudflare addres
 # The origin address is the one Traefik publishes 443 on (read from docker).
 ORIGIN_IP="$(docker inspect -f '{{with index .NetworkSettings.Ports "443/tcp"}}{{(index . 0).HostIp}}{{end}}' "$TRAEFIK_CONTAINER" 2>/dev/null || true)"
 if [[ "$ORIGIN_IP" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-  code="$(curl -s -o /dev/null -m 8 -w '%{http_code}' -A "Mozilla/5.0 (X11; Linux x86_64) submcp-deploy" \
-    --resolve "mcp.subimpact.net:443:${ORIGIN_IP}" https://mcp.subimpact.net/health || true)"
+  code=""
+  for i in $(seq 1 30); do
+    code="$(curl -s -o /dev/null -m 8 -w '%{http_code}' -A "Mozilla/5.0 (X11; Linux x86_64) submcp-deploy" \
+      --resolve "mcp.subimpact.net:443:${ORIGIN_IP}" https://mcp.subimpact.net/health || true)"
+    [ "$code" = 403 ] && break
+    sleep 1
+  done
   if [ "$code" = 403 ]; then
     echo "    direct origin request from ${ORIGIN_IP}: 403 (refused, as intended)"
   else
