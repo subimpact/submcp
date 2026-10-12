@@ -61,6 +61,13 @@ All configuration is via environment variables:
 | `TENANT_SECRET_KEY` | none | 32-byte key (base64 or 64 hex) that seals tenant credentials at rest (AES-256-GCM). Losing it loses those credentials |
 | `TENANT_MAX_SERVERS` | `10` | Upstream servers per tenant |
 | `TENANT_TEST_PER_MINUTE` | `10` | Test/refresh calls per tenant per minute |
+| `TENANT_POOL_BUDGET` | `30` | Tenant connections in use across all tenants (30% of the pool) |
+| `TENANT_NS_IN_FLIGHT` | `3` | Connections in use per tenant (its share of the budget) |
+| `TRUSTED_PROXY_CIDRS` | none | Proxies whose `CF-Connecting-IP` and `X-Forwarded-For` are believed. The deploy script sets Traefik's exact address |
+
+Startup validates the whole configuration before any listener is bound
+(`config.Validate`). A bad key, address, CIDR list or missing network stops the
+process with one error that lists every problem.
 
 ## Tenant upstreams
 
@@ -78,6 +85,26 @@ to tenant servers (operator servers are unchanged):
 - Header values are sealed at rest and shown masked (last four characters).
 - Test and refresh are rate limited per tenant. Inactive tenants can read and
   remove servers but not add, change or test them.
+
+## Database migrations
+
+Migrations are the embedded `internal/db/migrations/*.sql` files, applied in
+name order, one transaction each. Every new migration starts with a lock
+timeout, so a migration that cannot get its lock fails in seconds instead of
+queueing behind live traffic (SaaS 4c, N14):
+
+```sql
+-- NNNN_short_description.sql
+-- What this changes and why. Idempotent where the statement allows it.
+SET LOCAL lock_timeout = '5s';
+
+-- the change itself
+```
+
+Use `SET LOCAL`: each migration runs in its own transaction, so the setting ends
+at commit. A plain `SET` would stay on the pooled connection and change the lock
+timeout of the next query that reuses it. Migration 0006 predates this rule and
+is not changed.
 
 ## Database
 

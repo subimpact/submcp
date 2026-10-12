@@ -15,5 +15,5 @@ COPY --from=builder /submcp /submcp
 USER submcp
 EXPOSE 12008
 HEALTHCHECK --interval=10s --timeout=5s --retries=5 \
-  CMD wget -q -O /dev/null http://127.0.0.1:12008/health || exit 1
+  CMD sh -c 'a="${LISTEN_ADDR:-:12008}"; h="${a%:*}"; p="${a##*:}"; case "$h" in ""|0.0.0.0) h=127.0.0.1;; esac; wget -q -O /dev/null "http://$h:$p/health"' || exit 1
 ENTRYPOINT ["/submcp"]
