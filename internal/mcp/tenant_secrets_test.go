@@ -98,7 +98,8 @@ func TestMaskSecretShowsOnlyLastFour(t *testing.T) {
 		"":                 maskPrefix,
 		"abc":              maskPrefix,
 		"12345678":         maskPrefix, // short values reveal nothing
-		"123456789":        maskPrefix + "6789",
+		"123456789":        maskPrefix, // under 16 characters: bullets only (P3)
+		"123456789abcdefg": maskPrefix + "defg",
 		"Bearer abcd-1f2e": maskPrefix + "1f2e",
 		"ünïcödé-tok-wxyz": maskPrefix + "wxyz",
 	}
@@ -112,19 +113,19 @@ func TestMaskSecretShowsOnlyLastFour(t *testing.T) {
 func TestMaskHeadersNeverReturnsTheFullValue(t *testing.T) {
 	box := testBox(t)
 	secret := "Bearer super-secret-token-9999"
-	sealed, _ := SealHeaders(map[string]string{"Authorization": secret}, box)
+	sealed, _ := SealHeaders(map[string]string{"Authorization": secret}, box, testOwner, testServerUUID)
 
 	for _, b := range []*SecretBox{box, nil} {
-		masked := MaskHeaders(sealed, b)
+		masked := MaskHeaders(sealed, b, testOwner, testServerUUID)
 		raw, _ := json.Marshal(masked)
 		if strings.Contains(string(raw), "super-secret") {
 			t.Fatalf("masked output leaks the credential: %s", raw)
 		}
 	}
-	if got := MaskHeaders(sealed, box)["Authorization"]; got != maskPrefix+"9999" {
+	if got := MaskHeaders(sealed, box, testOwner, testServerUUID)["Authorization"]; got != maskPrefix+"9999" {
 		t.Fatalf("masked = %q, want last four visible", got)
 	}
-	if got := MaskHeaders(sealed, nil)["Authorization"]; got != maskPrefix {
+	if got := MaskHeaders(sealed, nil, testOwner, testServerUUID)["Authorization"]; got != maskPrefix {
 		t.Fatalf("admin view without a key = %q, want the bare mask", got)
 	}
 }
@@ -145,14 +146,14 @@ func TestMaskHeadersJSONForAdminAPI(t *testing.T) {
 
 func TestOpenSealedHeadersFailsClosedOnPlaintext(t *testing.T) {
 	box := testBox(t)
-	if _, err := OpenSealedHeaders(json.RawMessage(`{"Authorization":"plain-token"}`), box); err == nil {
+	if _, err := OpenSealedHeaders(json.RawMessage(`{"Authorization":"plain-token"}`), box, testOwner, testServerUUID); err == nil {
 		t.Fatal("a plaintext tenant credential must be refused")
 	}
-	if _, err := OpenSealedHeaders(json.RawMessage(`{"Authorization":"enc:v1:AAAA"}`), nil); err == nil {
+	if _, err := OpenSealedHeaders(json.RawMessage(`{"Authorization":"enc:v2:AAAA"}`), nil, testOwner, testServerUUID); err == nil {
 		t.Fatal("no key configured must refuse to use a sealed credential")
 	}
-	sealed, _ := SealHeaders(map[string]string{"Authorization": "tok-123456"}, box)
-	got, err := OpenSealedHeaders(sealed, box)
+	sealed, _ := SealHeaders(map[string]string{"Authorization": "tok-123456"}, box, testOwner, testServerUUID)
+	got, err := OpenSealedHeaders(sealed, box, testOwner, testServerUUID)
 	if err != nil || got["Authorization"] != "tok-123456" {
 		t.Fatalf("round trip = %v, %v", got, err)
 	}
@@ -187,3 +188,9 @@ func TestMergeMaskedHeadersKeepsStoredCredentialOnlyForAMatchingMask(t *testing.
 		t.Fatal("a mask for a header that does not exist must be refused")
 	}
 }
+
+// Fixed owner and server for the header tests (the AAD binds both).
+const (
+	testOwner      = "usera00000000000000000000000001"
+	testServerUUID = "00000000-0000-4000-8000-000000000042"
+)

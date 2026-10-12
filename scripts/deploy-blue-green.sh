@@ -23,6 +23,11 @@
 #   docker build -t submcp:prod .
 #   ./scripts/deploy-blue-green.sh
 # This script also tags the live container's image as submcp:prev when it can.
+#
+# Secrets never appear in argv: they go through a mode-600 --env-file that is
+# removed on exit. Container creation order: `docker create`, attach the
+# networks (the internal listener binds an address on submcp-internal, which
+# must exist before the process starts), then `docker start`.
 set -e
 
 cd "$(dirname "$0")/.."
@@ -49,8 +54,32 @@ fi
 # required: a deploy without them would silently disable the tenant API.
 : "${TENANT_API_SERVICE_TOKEN:?TENANT_API_SERVICE_TOKEN must be set (openssl rand -hex 32; see .env.prod.example)}"
 : "${TENANT_SECRET_KEY:?TENANT_SECRET_KEY must be set (openssl rand -base64 32; see .env.prod.example)}"
+: "${TENANT_MAX_SERVERS:=10}"
+: "${TENANT_TEST_PER_MINUTE:=10}"
+: "${TENANT_POOL_BUDGET:=30}"
+: "${TENANT_NS_IN_FLIGHT:=4}"
+# Proxies whose forwarded client headers are believed: the uy2 network, where
+# Traefik sits (and Postgres and the SaaS, which are not HTTP clients of the
+# public listener). Traefik's address can change on restart; a /24 keeps it
+# trusted, while an exact address would fall back to one shared rate bucket.
+: "${TRUSTED_PROXY_CIDRS:=10.0.5.0/24}"
 
 IMAGE="${1:-submcp:prod}"
+
+# --- Internal tenant network (SaaS phase 4b, #5) -----------------------------
+# submcp-internal is an --internal bridge: no route to the outside and no host
+# port. Only the gateway (both colours) and the SaaS attach to it. The gateway's
+# service listener binds the gateway's own address on it (10.77.0.10 / .11), so
+# a container on any other network cannot reach it, and nothing else is on it.
+INTERNAL_NET=submcp-internal
+INTERNAL_SUBNET=10.77.0.0/24
+INTERNAL_IP_PROD=10.77.0.10     # submcp-prod (the colour serving traffic)
+INTERNAL_IP_NEXT=10.77.0.11     # submcp-prod-next (the colour being rolled out)
+INTERNAL_ALIAS=submcp-gateway-internal
+if ! docker network inspect "$INTERNAL_NET" >/dev/null 2>&1; then
+  echo "==> creating $INTERNAL_NET ($INTERNAL_SUBNET, internal)"
+  docker network create --internal --subnet "$INTERNAL_SUBNET" "$INTERNAL_NET" >/dev/null
+fi
 
 # Rollback target: tag the image the LIVE submcp-prod container runs. Not the
 # submcp:prod tag, which the build being deployed has usually replaced already.
@@ -66,9 +95,6 @@ if [ "$IMAGE" != "submcp:prev" ]; then
   fi
 fi
 
-# Escaping: inside these double-quoted strings \` is a literal backtick and
-# \$ a literal dollar. The HostRegexp rule is Traefik v3 regex syntax; v2's
-# {subdomain:...} form matches nothing on v3.
 LABELS=(
   "traefik.docker.network=uy2gf2yhgu9cqi16y69is4ni"
   "traefik.enable=true"
@@ -112,34 +138,6 @@ ARGS=()
 for l in "${LABELS[@]}"; do
   ARGS+=(--label "$l")
 done
-
-# Same-host upstreams that live on another compose network. A container that
-# is recreated without these networks cannot resolve the upstream (pitfall 15):
-# the matrix MCP server (matrix-mcp) lives on the Matrix stack network, and
-# dropping it cut 20 operator tools until it was reattached. Every deploy
-# attaches them to the new container, idempotently.
-UPSTREAM_NETWORKS=(urhxt3a4nix782v8eo5da1cb)
-attach_upstream_networks() {
-  local net
-  for net in "${UPSTREAM_NETWORKS[@]}"; do
-    if ! docker inspect -f '{{json .NetworkSettings.Networks}}' "$1" | grep -q "\"$net\""; then
-      docker network connect "$net" "$1" || echo "WARN: could not attach $1 to $net" >&2
-    fi
-  done
-}
-
-# Tenant API env, shared by both containers. The internal listener is never
-# published (no -p); the SaaS reaches it as submcp-gateway:12013 on the uy2...
-# network through the alias below, which stays valid while blue/green renames
-# the containers.
-TENANT_ARGS=(
-  -e TENANT_API_SERVICE_TOKEN="$TENANT_API_SERVICE_TOKEN"
-  -e TENANT_SECRET_KEY="$TENANT_SECRET_KEY"
-  -e TENANT_API_INTERNAL_ADDR=":12013"
-  -e TENANT_MAX_SERVERS="${TENANT_MAX_SERVERS:-10}"
-  -e TENANT_TEST_PER_MINUTE="${TENANT_TEST_PER_MINUTE:-10}"
-)
-
 # Promote set: each label renamed once (-next -> prod). Renaming in a single
 # pass keeps the prod container free of stale -next router names.
 PROD_ARGS=()
@@ -149,23 +147,52 @@ for l in "${LABELS[@]}"; do
   PROD_ARGS+=(--label "$l")
 done
 
-echo "==> [1/6] starting submcp-prod-next (probe port 12009)"
-docker rm -f submcp-prod-next 2>/dev/null || true
-docker run -d --name submcp-prod-next --restart unless-stopped \
-  --network uy2gf2yhgu9cqi16y69is4ni --network-alias submcp-gateway --network shared \
-  -p 127.0.0.1:12009:12008 \
-  -e POSTGRES_HOST="$POSTGRES_HOST" -e POSTGRES_PORT="$POSTGRES_PORT" \
-  -e POSTGRES_USER="$POSTGRES_USER" \
-  -e POSTGRES_PASSWORD="$POSTGRES_PASSWORD" \
-  -e POSTGRES_DB="$POSTGRES_DB" \
-  -e LISTEN_ADDR=:12008 \
-  -e TENANT_BASE_HOST="$TENANT_BASE_HOST" \
-  -e TRIAL_DAILY_LIMIT="$TRIAL_DAILY_LIMIT" \
-  "${TENANT_ARGS[@]}" \
-  "${ARGS[@]}" \
-  "$IMAGE"
+# Secrets and shared settings go in a mode-600 env file, never in argv (argv is
+# visible in `ps` and in `docker inspect`). Removed on exit.
+ENV_FILE="$(mktemp)"
+chmod 600 "$ENV_FILE"
+trap 'rm -f "$ENV_FILE"' EXIT
+cat > "$ENV_FILE" <<ENVEOF
+POSTGRES_HOST=$POSTGRES_HOST
+POSTGRES_PORT=$POSTGRES_PORT
+POSTGRES_USER=$POSTGRES_USER
+POSTGRES_PASSWORD=$POSTGRES_PASSWORD
+POSTGRES_DB=$POSTGRES_DB
+LISTEN_ADDR=:12008
+TENANT_BASE_HOST=$TENANT_BASE_HOST
+TRIAL_DAILY_LIMIT=$TRIAL_DAILY_LIMIT
+TENANT_API_SERVICE_TOKEN=$TENANT_API_SERVICE_TOKEN
+TENANT_SECRET_KEY=$TENANT_SECRET_KEY
+TENANT_MAX_SERVERS=$TENANT_MAX_SERVERS
+TENANT_TEST_PER_MINUTE=$TENANT_TEST_PER_MINUTE
+TENANT_POOL_BUDGET=$TENANT_POOL_BUDGET
+TENANT_NS_IN_FLIGHT=$TENANT_NS_IN_FLIGHT
+TRUSTED_PROXY_CIDRS=$TRUSTED_PROXY_CIDRS
+ENVEOF
 
-attach_upstream_networks submcp-prod-next
+# Create a gateway container, attach its networks, then start it. The internal
+# listener binds $ip on submcp-internal, so that network must be attached before
+# the process starts. Memory is capped at 1g (RSS was about 12 MiB; the cap bounds
+# a hostile tools/list, SaaS phase 4b #6).
+create_gateway() {
+  local name="$1" hostport="$2" ip="$3"
+  shift 3
+  docker create --name "$name" --restart unless-stopped \
+    --memory 1g --memory-swap 1g \
+    --network uy2gf2yhgu9cqi16y69is4ni --network-alias submcp-gateway --network shared \
+    -p "127.0.0.1:${hostport}:12008" \
+    --env-file "$ENV_FILE" \
+    -e TENANT_API_INTERNAL_ADDR="${ip}:12013" \
+    "$@" \
+    "$IMAGE" >/dev/null
+  docker network connect --ip "$ip" --alias "$INTERNAL_ALIAS" "$INTERNAL_NET" "$name"
+  attach_upstream_networks "$name"
+  docker start "$name" >/dev/null
+}
+
+echo "==> [1/6] starting submcp-prod-next (probe port 12009, internal ${INTERNAL_IP_NEXT})"
+docker rm -f submcp-prod-next 2>/dev/null || true
+create_gateway submcp-prod-next 12009 "$INTERNAL_IP_NEXT" "${ARGS[@]}"
 
 echo "==> [2/6] waiting for health"
 for i in $(seq 1 30); do
@@ -180,6 +207,12 @@ for i in $(seq 1 30); do
   fi
   sleep 1
 done
+if ! docker logs submcp-prod-next 2>&1 | grep -q "tenant API (service auth) listening on ${INTERNAL_IP_NEXT}:12013"; then
+  echo "ERROR: the internal listener is not bound to ${INTERNAL_IP_NEXT}:12013 (see logs)" >&2
+  docker logs submcp-prod-next 2>&1 | tail -20
+  exit 1
+fi
+echo "    internal listener bound to ${INTERNAL_IP_NEXT}:12013 on ${INTERNAL_NET}"
 
 echo "==> [3/6] verifying public URL serves the new build"
 # The landing page title is a marker for the new build (old image has no
@@ -193,23 +226,9 @@ echo "==> [4/6] stopping old container"
 docker stop submcp-prod 2>/dev/null || true
 docker rm submcp-prod 2>/dev/null || true
 
-echo "==> [5/6] promoting next -> prod with host port 12008 (Tailscale)"
+echo "==> [5/6] promoting next -> prod with host port 12008 (Tailscale), internal ${INTERNAL_IP_PROD}"
 docker rm -f submcp-prod-next 2>/dev/null || true
-docker run -d --name submcp-prod --restart unless-stopped \
-  --network uy2gf2yhgu9cqi16y69is4ni --network-alias submcp-gateway --network shared \
-  -p 127.0.0.1:12008:12008 \
-  -e POSTGRES_HOST="$POSTGRES_HOST" -e POSTGRES_PORT="$POSTGRES_PORT" \
-  -e POSTGRES_USER="$POSTGRES_USER" \
-  -e POSTGRES_PASSWORD="$POSTGRES_PASSWORD" \
-  -e POSTGRES_DB="$POSTGRES_DB" \
-  -e LISTEN_ADDR=:12008 \
-  -e TENANT_BASE_HOST="$TENANT_BASE_HOST" \
-  -e TRIAL_DAILY_LIMIT="$TRIAL_DAILY_LIMIT" \
-  "${TENANT_ARGS[@]}" \
-  "${PROD_ARGS[@]}" \
-  "$IMAGE"
-
-attach_upstream_networks submcp-prod
+create_gateway submcp-prod 12008 "$INTERNAL_IP_PROD" "${PROD_ARGS[@]}"
 
 echo "==> [6/6] verifying all entry points"
 for i in $(seq 1 30); do
@@ -220,6 +239,11 @@ for i in $(seq 1 30); do
   [ "$i" = 30 ] && { echo "ERROR: prod never healthy" >&2; exit 1; }
   sleep 1
 done
+if ! docker logs submcp-prod 2>&1 | grep -q "tenant API (service auth) listening on ${INTERNAL_IP_PROD}:12013"; then
+  echo "ERROR: submcp-prod internal listener is not on ${INTERNAL_IP_PROD}:12013" >&2
+  exit 1
+fi
+echo "    internal listener bound to ${INTERNAL_IP_PROD}:12013 on ${INTERNAL_NET}"
 curl -sf -o /dev/null -m 8 https://mcp.subimpact.net/health && echo "    public OK"
 curl -sf -o /dev/null -m 8 https://vmi3274017-vps.tailab0a04.ts.net:12008/health && echo "    tailscale OK"
 # Tenant wildcard: the cert may still be issuing (DNS-01 takes a minute or

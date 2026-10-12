@@ -21,8 +21,11 @@ type spyStore struct {
 	ownedNamespaces map[string]*string // namespace uuid -> owner userID (nil = root)
 	ownedServers    map[string]*string // server uuid -> owner userID
 	listCalls       [][]*string
-	deleteCalls     []struct{ uuid string; userID *string }
-	updateCalls     []struct {
+	deleteCalls     []struct {
+		uuid   string
+		userID *string
+	}
+	updateCalls []struct {
 		uuid   string
 		userID *string
 	}
@@ -30,14 +33,22 @@ type spyStore struct {
 		uuid   string
 		userID *string
 	}
-	mapped     bool
-	mapCalls   int
-	createKey  *struct{ admin bool; userID *string }
+	mapped    bool
+	mapCalls  int
+	createKey *struct {
+		admin  bool
+		userID *string
+	}
 	createEpNS *string // namespace uuid used in CreateEndpoint
 }
 
-func (s *spyStore) CountNamespaces(context.Context) (int, error)      { return 0, nil }
-func (s *spyStore) CountTools(context.Context) (int, error)           { return 0, nil }
+func (s *spyStore) CountNamespaces(context.Context) (int, error)         { return 0, nil }
+func (s *spyStore) CountTools(context.Context) (int, error)              { return 0, nil }
+func (s *spyStore) CountOperatorNamespaces(context.Context) (int, error) { return 0, nil }
+func (s *spyStore) CountOperatorTools(context.Context) (int, error)      { return 0, nil }
+func (s *spyStore) ListOperatorServers(ctx context.Context) ([]db.MCPServer, error) {
+	return s.ListServers(ctx, nil)
+}
 func (s *spyStore) CreateAPIKey(_ context.Context, _ string, _ string, isAdmin bool, userID *string) (*db.APIKey, error) {
 	if s.createKey == nil {
 		s.createKey = &struct {
@@ -54,7 +65,7 @@ func (s *spyStore) CreateEndpoint(_ context.Context, e *db.Endpoint) error {
 	return nil
 }
 func (s *spyStore) CreateNamespace(context.Context, *db.Namespace) error { return nil }
-func (s *spyStore) CreateServer(context.Context, *db.MCPServer) error   { return nil }
+func (s *spyStore) CreateServer(context.Context, *db.MCPServer) error    { return nil }
 func (s *spyStore) DeleteEndpoint(_ context.Context, uuid string, userID *string) error {
 	s.deleteCalls = append(s.deleteCalls, struct {
 		uuid   string
@@ -96,7 +107,7 @@ func (s *spyStore) GetServer(_ context.Context, uuid string, userID *string) (*d
 	}
 	return &db.MCPServer{UUID: uuid, UserID: owner}, nil
 }
-func (s *spyStore) ListAPIKeys(context.Context, *string) ([]db.APIKey, error)  { return nil, nil }
+func (s *spyStore) ListAPIKeys(context.Context, *string) ([]db.APIKey, error) { return nil, nil }
 func (s *spyStore) ListEndpoints(_ context.Context, userID *string) ([]db.Endpoint, error) {
 	s.listCalls = append(s.listCalls, []*string{userID})
 	return nil, nil
@@ -127,8 +138,8 @@ func (s *spyStore) UpdateEndpoint(_ context.Context, e *db.Endpoint, userID *str
 	}{e.UUID, userID})
 	return nil
 }
-func (s *spyStore) UpdateServer(context.Context, *db.MCPServer, *string) error  { return nil }
-func (s *spyStore) ValidateAPIKey(context.Context, string) (*db.APIKey, error)   { return nil, nil }
+func (s *spyStore) UpdateServer(context.Context, *db.MCPServer, *string) error { return nil }
+func (s *spyStore) ValidateAPIKey(context.Context, string) (*db.APIKey, error) { return nil, nil }
 
 // sessAuth authenticates a request through the REAL session store
 // (requireAuth runs first and rejects cookie-less requests with 401).

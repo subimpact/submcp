@@ -131,7 +131,8 @@ func withCORS(next http.Handler) http.Handler {
 		if origin != "" {
 			w.Header().Set("Access-Control-Allow-Origin", origin)
 			w.Header().Set("Vary", "Origin")
-			w.Header().Set("Access-Control-Allow-Credentials", "true")
+			// No Access-Control-Allow-Credentials (P3): nothing on this handler
+			// authenticates with cookies, so the header only widened CORS.
 		}
 		// P2-5b security headers (defense in depth; TLS is terminated at
 		// Traefik, so HSTS is set there — these cover the app layer).

@@ -29,6 +29,11 @@ type UpstreamClient struct {
 
 	httpClient *http.Client
 
+	// Tenant tools/list caps (SaaS phase 4b, #6). Zero means no cap (operator).
+	maxPages int
+	maxBytes int
+	maxTools int
+
 	sessionID string
 	initRes   *InitializeResult
 	connected bool
@@ -47,6 +52,16 @@ type UpstreamConfig struct {
 	Policy *TenantNetPolicy
 }
 
+// Aggregate caps for one tenant tools/list (SaaS phase 4b, #6). A per-response
+// cap alone let one hostile upstream send 50 pages of 3 MiB each. Going past
+// any of these is an error, not a truncated list.
+const (
+	tenantToolsMaxPages   = 5
+	tenantToolsMaxBytes   = 2 << 20
+	tenantToolsMaxTools   = 500
+	operatorToolsMaxPages = 50 // P1-12 cap: 50 pages is far beyond any real tool list
+)
+
 // NewUpstreamClient creates a client for a STREAMABLE_HTTP upstream.
 func NewUpstreamClient(cfg UpstreamConfig) *UpstreamClient {
 	auth := ""
@@ -60,6 +75,9 @@ func NewUpstreamClient(cfg UpstreamConfig) *UpstreamClient {
 			authHeader: auth,
 			extraHdrs:  cfg.Headers,
 			strict:     true,
+			maxPages:   tenantToolsMaxPages,
+			maxBytes:   tenantToolsMaxBytes,
+			maxTools:   tenantToolsMaxTools,
 			httpClient: &http.Client{
 				Timeout:       cfg.Timeout,
 				Transport:     cfg.Policy.transport(),
@@ -83,6 +101,7 @@ func NewUpstreamClient(cfg UpstreamConfig) *UpstreamClient {
 		url:        cfg.URL,
 		authHeader: auth,
 		extraHdrs:  cfg.Headers,
+		maxPages:   operatorToolsMaxPages,
 		httpClient: &http.Client{Timeout: cfg.Timeout, Transport: transport},
 	}
 }
@@ -164,8 +183,14 @@ func (c *UpstreamClient) ListTools(ctx context.Context) ([]Tool, error) {
 	sid := c.sessionID
 	c.mu.Unlock()
 
-	const maxPages = 50 // P1-12 cap: 50 pages is far beyond any real tool list
-	var all []Tool
+	maxPages := c.maxPages
+	if maxPages <= 0 {
+		maxPages = operatorToolsMaxPages
+	}
+	var (
+		all   []Tool
+		total int // response bytes read so far (tenant cap)
+	)
 	cursor := ""
 	for page := 0; page < maxPages; page++ {
 		params := map[string]any{}
@@ -216,6 +241,13 @@ func (c *UpstreamClient) ListTools(ctx context.Context) ([]Tool, error) {
 			return nil, err
 		}
 		all = append(all, result.Tools...)
+		total += len(msg)
+		if c.maxBytes > 0 && total > c.maxBytes {
+			return nil, fmt.Errorf("tools/list %s: tool list exceeds %d bytes", c.serverName, c.maxBytes)
+		}
+		if c.maxTools > 0 && len(all) > c.maxTools {
+			return nil, fmt.Errorf("tools/list %s: more than %d tools", c.serverName, c.maxTools)
+		}
 		if result.NextCursor == nil || *result.NextCursor == "" {
 			return all, nil
 		}
@@ -307,7 +339,13 @@ func (c *UpstreamClient) statusError(op string, status int, raw []byte) error {
 	if c.strict && status >= 300 && status < 400 {
 		return fmt.Errorf("%s %s: HTTP %d: redirects are not followed for tenant servers; register the final https URL", op, c.serverName, status)
 	}
-	return fmt.Errorf("%s %s: HTTP %d: %s", op, c.serverName, status, truncate(string(raw), 300))
+	body := string(raw)
+	if c.strict {
+		// Redact before truncating: a cut can split a credential so that no
+		// full form is left to match (P3, upstream.go truncate note).
+		body = redactSecrets(body, c.extraHdrs)
+	}
+	return fmt.Errorf("%s %s: HTTP %d: %s", op, c.serverName, status, truncate(body, 300))
 }
 
 func (c *UpstreamClient) applyHeaders(req *http.Request) {

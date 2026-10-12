@@ -11,21 +11,34 @@ import (
 	"strings"
 )
 
-// Tenant credential storage (SaaS phase 4).
+// Tenant credential storage (SaaS phase 4, format v2).
 //
 // Header values on tenant-managed servers are sealed with AES-256-GCM under
 // TENANT_SECRET_KEY (32 bytes: `openssl rand -base64 32`). A sealed value is
-// "enc:v1:" + base64url(nonce || ciphertext). The header name is bound as
-// associated data, so a ciphertext cannot be moved to another header. Losing
-// TENANT_SECRET_KEY makes every stored tenant credential unrecoverable, so the
-// key must be backed up next to the database.
+// "enc:v2:" + base64url(nonce || ciphertext). The associated data binds the
+// ciphertext to its exact row and header:
+//
+//	owner user id | server uuid | header name
+//
+// so a value copied to another header, another server or another owner fails
+// to authenticate. The v1 format ("enc:v1:", header name only) is not accepted
+// at run time; ResealLegacyTenantHeaders rewrites every v1 value to v2 at boot.
+// Losing TENANT_SECRET_KEY makes every stored tenant credential unrecoverable,
+// so the key must be backed up next to the database.
 
-const sealPrefix = "enc:v1:"
+const (
+	sealPrefix       = "enc:v2:"
+	legacySealPrefix = "enc:v1:"
+)
 
 // maskPrefix is the fixed-length mask shown in place of a credential. It never
 // reveals more than the last four characters, and it does not reveal the
 // credential's length either.
 const maskPrefix = "\u2022\u2022\u2022\u2022\u2022\u2022\u2022\u2022"
+
+// maskMinLen is the length below which a credential shows only the mask. Four
+// visible characters of a short value are a large fraction of its entropy.
+const maskMinLen = 16
 
 // ErrNoSecretKey means a tenant credential must be used but TENANT_SECRET_KEY
 // is not configured. The gateway fails closed rather than using a plaintext copy.
@@ -59,8 +72,18 @@ func NewSecretBox(key string) (*SecretBox, error) {
 	return &SecretBox{aead: gcm}, nil
 }
 
-// Seal encrypts plain, binding aad (the header name).
+// tenantHeaderAAD is the associated data for one stored header value. The
+// separator cannot occur in a user id, a UUID or a validated header name.
+func tenantHeaderAAD(owner, serverUUID, header string) string {
+	return owner + "\x1f" + serverUUID + "\x1f" + header
+}
+
+// Seal encrypts plain, binding aad.
 func (b *SecretBox) Seal(plain, aad string) (string, error) {
+	return sealWith(b, sealPrefix, plain, aad)
+}
+
+func sealWith(b *SecretBox, prefix, plain, aad string) (string, error) {
 	nonce := make([]byte, b.aead.NonceSize())
 	if _, err := rand.Read(nonce); err != nil {
 		return "", err
@@ -69,15 +92,19 @@ func (b *SecretBox) Seal(plain, aad string) (string, error) {
 	out := make([]byte, 0, len(nonce)+len(ct))
 	out = append(out, nonce...)
 	out = append(out, ct...)
-	return sealPrefix + base64.RawURLEncoding.EncodeToString(out), nil
+	return prefix + base64.RawURLEncoding.EncodeToString(out), nil
 }
 
-// Open decrypts a value produced by Seal with the same aad.
+// Open decrypts a v2 value produced by Seal with the same aad.
 func (b *SecretBox) Open(sealed, aad string) (string, error) {
-	if !IsSealed(sealed) {
-		return "", errors.New("value is not sealed")
+	if !strings.HasPrefix(sealed, sealPrefix) {
+		return "", errors.New("value is not sealed in the current format")
 	}
-	raw, err := base64.RawURLEncoding.DecodeString(sealed[len(sealPrefix):])
+	return openWith(b, sealed[len(sealPrefix):], aad)
+}
+
+func openWith(b *SecretBox, body, aad string) (string, error) {
+	raw, err := base64.RawURLEncoding.DecodeString(body)
 	if err != nil {
 		return "", errors.New("sealed value is malformed")
 	}
@@ -92,16 +119,18 @@ func (b *SecretBox) Open(sealed, aad string) (string, error) {
 	return string(pt), nil
 }
 
-// IsSealed reports whether a stored header value is in the sealed form.
+// IsSealed reports whether a stored header value is in an encrypted form
+// (current or legacy).
 func IsSealed(v string) bool {
-	return strings.HasPrefix(v, sealPrefix)
+	return strings.HasPrefix(v, sealPrefix) || strings.HasPrefix(v, legacySealPrefix)
 }
 
 // MaskSecret returns the display form of a credential: the fixed mask, plus
-// the last four characters when the value is longer than eight.
+// the last four characters when the value is at least maskMinLen long. Shorter
+// values show only the mask.
 func MaskSecret(v string) string {
 	r := []rune(v)
-	if len(r) <= 8 {
+	if len(r) < maskMinLen {
 		return maskPrefix
 	}
 	return maskPrefix + string(r[len(r)-4:])
@@ -113,10 +142,10 @@ func IsMaskedValue(v string) bool {
 	return strings.HasPrefix(v, maskPrefix)
 }
 
-// OpenSealedHeaders decrypts a tenant header map. Every value must be sealed;
-// a plaintext value is refused (fail closed) so a row written by another path
-// is never used as a credential silently.
-func OpenSealedHeaders(raw json.RawMessage, box *SecretBox) (map[string]string, error) {
+// OpenSealedHeaders decrypts a tenant header map for one server. Every value
+// must be sealed in the current format and bound to (owner, serverUUID); a
+// plaintext or legacy value is refused (fail closed).
+func OpenSealedHeaders(raw json.RawMessage, box *SecretBox, owner, serverUUID string) (map[string]string, error) {
 	out := map[string]string{}
 	if len(raw) == 0 {
 		return out, nil
@@ -129,10 +158,13 @@ func OpenSealedHeaders(raw json.RawMessage, box *SecretBox) (map[string]string, 
 		if !IsSealed(v) {
 			return nil, errors.New("a stored tenant credential is not encrypted; refusing to use it")
 		}
+		if strings.HasPrefix(v, legacySealPrefix) {
+			return nil, errors.New("a stored tenant credential uses the legacy format and has not been re-sealed")
+		}
 		if box == nil {
 			return nil, ErrNoSecretKey
 		}
-		plain, err := box.Open(v, k)
+		plain, err := box.Open(v, tenantHeaderAAD(owner, serverUUID, k))
 		if err != nil {
 			return nil, errors.New("a stored tenant credential could not be decrypted")
 		}
@@ -141,16 +173,16 @@ func OpenSealedHeaders(raw json.RawMessage, box *SecretBox) (map[string]string, 
 	return out, nil
 }
 
-// SealHeaders encrypts every value of a tenant header map and returns the JSON
-// stored in mcp_servers.headers. Header names stay in the clear so the list
-// view can show them.
-func SealHeaders(plain map[string]string, box *SecretBox) (json.RawMessage, error) {
+// SealHeaders encrypts every value of a tenant header map for one server and
+// returns the JSON stored in mcp_servers.headers. Header names stay in the
+// clear so the list view can show them.
+func SealHeaders(plain map[string]string, box *SecretBox, owner, serverUUID string) (json.RawMessage, error) {
 	sealed := make(map[string]string, len(plain))
 	for k, v := range plain {
 		if box == nil {
 			return nil, ErrNoSecretKey
 		}
-		s, err := box.Seal(v, k)
+		s, err := box.Seal(v, tenantHeaderAAD(owner, serverUUID, k))
 		if err != nil {
 			return nil, err
 		}
@@ -162,7 +194,7 @@ func SealHeaders(plain map[string]string, box *SecretBox) (json.RawMessage, erro
 // MaskHeaders returns the display form of a stored header map. Sealed values
 // are opened with box (when given) and masked; plaintext values (operator rows)
 // are masked directly; a sealed value with no key is shown as the bare mask.
-func MaskHeaders(raw json.RawMessage, box *SecretBox) map[string]string {
+func MaskHeaders(raw json.RawMessage, box *SecretBox, owner, serverUUID string) map[string]string {
 	out := map[string]string{}
 	if len(raw) == 0 {
 		return out
@@ -175,10 +207,10 @@ func MaskHeaders(raw json.RawMessage, box *SecretBox) map[string]string {
 		switch {
 		case !IsSealed(v):
 			out[k] = MaskSecret(v)
-		case box == nil:
+		case box == nil || strings.HasPrefix(v, legacySealPrefix):
 			out[k] = maskPrefix
 		default:
-			if plain, err := box.Open(v, k); err == nil {
+			if plain, err := box.Open(v, tenantHeaderAAD(owner, serverUUID, k)); err == nil {
 				out[k] = MaskSecret(plain)
 			} else {
 				out[k] = maskPrefix
@@ -192,7 +224,7 @@ func MaskHeaders(raw json.RawMessage, box *SecretBox) map[string]string {
 // no key. Operator values are masked to their last four characters; sealed
 // tenant values show only the bare mask.
 func MaskHeadersJSON(raw json.RawMessage) json.RawMessage {
-	b, err := json.Marshal(MaskHeaders(raw, nil))
+	b, err := json.Marshal(MaskHeaders(raw, nil, "", ""))
 	if err != nil {
 		return json.RawMessage(`{}`)
 	}

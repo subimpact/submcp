@@ -36,16 +36,18 @@ var (
 )
 
 type fakeTenantDB struct {
-	mu        sync.Mutex
-	tenants   map[string]*db.Tenant
-	endpoints []*db.Endpoint
-	keys      map[string]*db.APIKey
-	servers   map[string]*db.MCPServer
-	order     []string
-	tools     map[string][]db.Tool
-	mappings  map[string]db.NamespaceToolMapping // ns|toolUUID
-	srvMap    map[string]db.ServerStatus         // ns|serverUUID
-	seq       int
+	mu          sync.Mutex
+	tenants     map[string]*db.Tenant
+	endpoints   []*db.Endpoint
+	keys        map[string]*db.APIKey
+	servers     map[string]*db.MCPServer
+	order       []string
+	tools       map[string][]db.Tool
+	mappings    map[string]db.NamespaceToolMapping // ns|toolUUID
+	srvMap      map[string]db.ServerStatus         // ns|serverUUID
+	seq         int
+	bumps       int  // TryBumpUsage calls (trial cap accounting)
+	usageDenied bool // TryBumpUsage refuses when set
 }
 
 func newFakeTenantDB() *fakeTenantDB {
@@ -133,7 +135,17 @@ func (f *fakeTenantDB) Entitlement(_ context.Context, t *db.Tenant) (*db.TenantE
 func (f *fakeTenantDB) UsageToday(context.Context, string) (int64, error) { return 0, nil }
 func (f *fakeTenantDB) BumpUsage(context.Context, string) error           { return nil }
 func (f *fakeTenantDB) TryBumpUsage(context.Context, string, int64) (bool, error) {
-	return true, nil
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.bumps++
+	return !f.usageDenied, nil
+}
+
+// setUsageAllowed controls whether TryBumpUsage grants the next reservation.
+func (f *fakeTenantDB) setUsageAllowed(ok bool) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.usageDenied = !ok
 }
 
 func (f *fakeTenantDB) TenantNamespaceUUID(_ context.Context, uid string) (string, error) {
@@ -187,7 +199,9 @@ func (f *fakeTenantDB) CreateTenantServer(_ context.Context, uid, ns string, s *
 	if owned >= max {
 		return db.ErrTenantServerLimit
 	}
-	s.UUID = f.newUUID()
+	if s.UUID == "" { // the real store honours a caller-chosen id (sealed to it)
+		s.UUID = f.newUUID()
+	}
 	s.CreatedAt = time.Now()
 	s.ErrorStatus = db.ErrorStatusNone
 	s.TenantManaged = true
@@ -437,19 +451,76 @@ type fxUpstream struct {
 	mu    sync.Mutex
 	calls int
 	auth  []string
+	hosts []string // Host header of each request
+	// rejectEcho makes every request fail with 401 and echo the Authorization
+	// value, as some upstreams do. rejectJSON echoes it JSON-escaped.
+	rejectEcho bool
+	rejectJSON bool
+	// hang blocks each request until the client gives up (deadline tests).
+	hang bool
+	// bigTools, when set, replaces the tools/list answer with this function's
+	// output for the page cursor (aggregate-cap tests).
+	bigTools func(cursor string) (body string)
+	// errorBody is returned with HTTP 500 when set (redaction tests).
+	errorBody string
+	// stop releases handlers that are still blocked when the test ends.
+	stop chan struct{}
+}
+
+func (u *fxUpstream) setBehaviour(f func(*fxUpstream)) {
+	u.mu.Lock()
+	defer u.mu.Unlock()
+	f(u)
+}
+
+func (u *fxUpstream) lastHost() string {
+	u.mu.Lock()
+	defer u.mu.Unlock()
+	if len(u.hosts) == 0 {
+		return ""
+	}
+	return u.hosts[len(u.hosts)-1]
 }
 
 func newFxUpstream(t *testing.T) *fxUpstream {
 	t.Helper()
-	u := &fxUpstream{}
+	u := &fxUpstream{stop: make(chan struct{})}
 	u.srv = httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		u.mu.Lock()
 		u.calls++
 		u.auth = append(u.auth, r.Header.Get("Authorization"))
+		u.hosts = append(u.hosts, r.Host)
+		rejectEcho, rejectJSON, hang := u.rejectEcho, u.rejectJSON, u.hang
+		bigTools, errorBody := u.bigTools, u.errorBody
 		u.mu.Unlock()
+		if hang {
+			select {
+			case <-r.Context().Done():
+			case <-u.stop:
+			}
+			return
+		}
+		if rejectEcho || rejectJSON {
+			w.WriteHeader(http.StatusUnauthorized)
+			if rejectJSON {
+				enc, _ := json.Marshal(r.Header.Get("Authorization"))
+				fmt.Fprintf(w, `{"error":"token rejected: %s"}`, enc[1:len(enc)-1])
+				return
+			}
+			fmt.Fprintf(w, "token rejected: %s", r.Header.Get("Authorization"))
+			return
+		}
+		if errorBody != "" {
+			w.WriteHeader(http.StatusInternalServerError)
+			fmt.Fprint(w, errorBody)
+			return
+		}
 		var req struct {
 			ID     json.RawMessage `json:"id"`
 			Method string          `json:"method"`
+			Params struct {
+				Cursor string `json:"cursor"`
+			} `json:"params"`
 		}
 		_ = json.NewDecoder(r.Body).Decode(&req)
 		w.Header().Set("Content-Type", "application/json")
@@ -458,6 +529,10 @@ func newFxUpstream(t *testing.T) *fxUpstream {
 			w.Header().Set("Mcp-Session-Id", "up-1")
 			fmt.Fprintf(w, `{"jsonrpc":"2.0","id":%s,"result":{"protocolVersion":"2025-03-26","capabilities":{"tools":{}},"serverInfo":{"name":"fixture","version":"1"}}}`, req.ID)
 		case "tools/list":
+			if bigTools != nil {
+				fmt.Fprint(w, bigTools(req.Params.Cursor))
+				return
+			}
 			fmt.Fprintf(w, `{"jsonrpc":"2.0","id":%s,"result":{"tools":[{"name":"echo","description":"Echo","inputSchema":{"type":"object"}},{"name":"add","description":"Add","inputSchema":{"type":"object"}}]}}`, req.ID)
 		case "tools/call":
 			fmt.Fprintf(w, `{"jsonrpc":"2.0","id":%s,"result":{"content":[{"type":"text","text":"upstream-said-hi"}]}}`, req.ID)
@@ -466,6 +541,9 @@ func newFxUpstream(t *testing.T) *fxUpstream {
 		}
 	}))
 	t.Cleanup(u.srv.Close)
+	// Cleanups run last-in first-out: release blocked handlers before Close waits
+	// for them.
+	t.Cleanup(func() { close(u.stop) })
 	return u
 }
 
@@ -505,25 +583,31 @@ func newTenantFixture(t *testing.T, maxServers int) *tenantFixture {
 	up := newFxUpstream(t)
 	pool := x509.NewCertPool()
 	pool.AddCert(up.srv.Certificate())
-	policy := &TenantNetPolicy{
-		Lookup: fakeResolver{
-			fxUpstreamHost:              {fxUpstreamIP},
-			"loop.tenant-fixture.net":   {"127.0.0.1"},
-			"rebind.tenant-fixture.net": {"10.0.5.2"},
-			"mixed.tenant-fixture.net":  {fxUpstreamIP, "192.168.1.10"},
-			"meta.tenant-fixture.net":   {"169.254.169.254"},
-			"cgnat.tenant-fixture.net":  {"100.100.100.100"},
-		}.lookup,
-		Dial: func(ctx context.Context, network, addr string) (net.Conn, error) {
-			if addr == fxUpstreamIP+":443" {
-				var d net.Dialer
-				return d.DialContext(ctx, "tcp", up.srv.Listener.Addr().String())
-			}
-			return nil, fmt.Errorf("test dialer: unexpected dial to %s", addr)
-		},
-		Ports: []string{"443"},
-		TLS:   &tls.Config{RootCAs: pool, ServerName: "example.com"},
+	// Production rules (address policy, deny-list, port, scheme) come from
+	// NewTenantNetPolicy, as in main. Only DNS, the final dial and the trust roots
+	// are substituted.
+	policy := NewTenantNetPolicy(fxBaseHost)
+	policy.Lookup = fakeResolver{
+		fxUpstreamHost:              {fxUpstreamIP},
+		"loop.tenant-fixture.net":   {"127.0.0.1"},
+		"rebind.tenant-fixture.net": {"10.0.5.2"},
+		"mixed.tenant-fixture.net":  {fxUpstreamIP, "192.168.1.10"},
+		"meta.tenant-fixture.net":   {"169.254.169.254"},
+		"cgnat.tenant-fixture.net":  {"100.100.100.100"},
+		// Regression fixtures (SaaS phase 4b PoCs). The base host resolves to a
+		// public address, so only the deny-list can refuse it.
+		"attacker.tenant-fixture.net": {fxUpstreamIP},
+		"v6.tenant-fixture.net":       {"::7f00:1"},
+		fxBaseHost:                    {fxUpstreamIP},
+	}.lookup
+	policy.Dial = func(ctx context.Context, network, addr string) (net.Conn, error) {
+		if addr == fxUpstreamIP+":443" {
+			var d net.Dialer
+			return d.DialContext(ctx, "tcp", up.srv.Listener.Addr().String())
+		}
+		return nil, fmt.Errorf("test dialer: unexpected dial to %s", addr)
 	}
+	policy.TLS = &tls.Config{RootCAs: pool, ServerName: "example.com"}
 	fdb := newFakeTenantDB()
 	box, err := NewSecretBox(fxSecretKeyB64)
 	if err != nil {
@@ -876,7 +960,7 @@ func TestTenantStoresCredentialsSealedAndMasked(t *testing.T) {
 
 	// Row at rest: sealed, never plaintext.
 	stored := string(fx.db.servers[id].Headers)
-	if strings.Contains(stored, "tenant-live-token") || !strings.Contains(stored, "enc:v1:") {
+	if strings.Contains(stored, "tenant-live-token") || !strings.Contains(stored, "enc:v2:") {
 		t.Fatalf("stored headers = %s", stored)
 	}
 	// Every read path masks.

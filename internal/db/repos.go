@@ -326,6 +326,53 @@ func (p *Pool) CountNamespaces(ctx context.Context) (int, error) {
 	return n, err
 }
 
+// CountOperatorTools counts tool rows that belong to operator (non tenant-managed)
+// servers. It is the public-stats count: tenant tools are never published.
+func (p *Pool) CountOperatorTools(ctx context.Context) (int, error) {
+	var n int
+	err := p.QueryRow(ctx, `
+		SELECT count(*) FROM tools t
+		JOIN mcp_servers s ON s.uuid = t.mcp_server_uuid
+		WHERE s.tenant_managed = false`).Scan(&n)
+	return n, err
+}
+
+// CountOperatorNamespaces counts namespaces owned by the operator: legacy
+// NULL-owner rows and the operator tenant's rows. Tenant namespaces are not
+// published, so the public count does not track signups.
+func (p *Pool) CountOperatorNamespaces(ctx context.Context) (int, error) {
+	var n int
+	err := p.QueryRow(ctx, `
+		SELECT count(*) FROM namespaces
+		WHERE user_id IS NULL
+		   OR user_id IN (SELECT user_id FROM tenants WHERE slug = 'subimpact')`).Scan(&n)
+	return n, err
+}
+
+// ListOperatorServers returns every operator (non tenant-managed) server. It is
+// the public-stats list: tenant upstreams are never published.
+func (p *Pool) ListOperatorServers(ctx context.Context) ([]MCPServer, error) {
+	rows, err := p.Query(ctx, `
+		SELECT `+mcpServerCols+`
+		FROM mcp_servers
+		WHERE tenant_managed = false
+		ORDER BY created_at DESC`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var out []MCPServer
+	for rows.Next() {
+		var s MCPServer
+		if err := scanServerRow(rows.Scan, &s); err != nil {
+			return nil, err
+		}
+		out = append(out, s)
+	}
+	return out, rows.Err()
+}
+
 // --- Admin UI repo methods ---
 
 // ListServers returns all MCP servers for a tenant (user_id filter).

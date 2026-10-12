@@ -26,6 +26,11 @@ var staticFS embed.FS
 // Tenant scoping (SaaS Phase 1): *string userID filters; nil = legacy
 // single-tenant view (operator root).
 type Store interface {
+	// Public-stats queries: operator rows only (tenant rows are never published).
+	CountOperatorNamespaces(ctx context.Context) (int, error)
+	CountOperatorTools(ctx context.Context) (int, error)
+	ListOperatorServers(ctx context.Context) ([]db.MCPServer, error)
+	// Admin overview counts (all rows, scoped by the caller's user).
 	CountNamespaces(ctx context.Context) (int, error)
 	CountTools(ctx context.Context) (int, error)
 	CreateAPIKey(ctx context.Context, name, key string, isAdmin bool, userID *string) (*db.APIKey, error)
@@ -204,25 +209,29 @@ func (u *UI) handlePublicStats(w http.ResponseWriter, r *http.Request) {
 	u.statsMu.Unlock()
 
 	ctx := r.Context()
-	// Public stats remain global (marketing truth on the landing page),
-	// not tenant-scoped.
-	servers, err := u.db.ListServers(ctx, nil)
+	// Public stats are the operator's marketing truth. Tenant upstreams (names,
+	// counts, status) and tenant namespaces are never published: the list and
+	// every count come from operator rows only.
+	servers, err := u.db.ListOperatorServers(ctx)
 	if err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": "unavailable"})
 		return
 	}
-	toolCount, err := u.db.CountTools(ctx)
+	toolCount, err := u.db.CountOperatorTools(ctx)
 	if err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": "unavailable"})
 		return
 	}
-	nsCount, err := u.db.CountNamespaces(ctx)
+	nsCount, err := u.db.CountOperatorNamespaces(ctx)
 	if err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": "unavailable"})
 		return
 	}
 	upstreams := make([]map[string]any, 0, len(servers))
 	for _, s := range servers {
+		if s.TenantManaged {
+			continue // defence in depth; the query already excludes them
+		}
 		upstreams = append(upstreams, map[string]any{
 			"name":         s.Name,
 			"type":         s.Type,
@@ -232,7 +241,7 @@ func (u *UI) handlePublicStats(w http.ResponseWriter, r *http.Request) {
 	payload := map[string]any{
 		"version":    "0.1.0",
 		"uptime":     time.Since(u.start).Round(time.Second).String(),
-		"servers":    len(servers),
+		"servers":    len(upstreams),
 		"namespaces": nsCount,
 		"tools":      toolCount,
 		"upstreams":  upstreams,
@@ -337,7 +346,7 @@ func sessUserID(r *http.Request) *string {
 func (u *UI) requireAuth(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		// P2-3: admin allowlist — check source IP before anything else.
-		if !u.allowlistAllows(clientIP(r)) {
+		if !u.allowlistAllows(mcp.ClientIP(r)) {
 			writeJSON(w, http.StatusForbidden, map[string]any{"error": "forbidden"})
 			return
 		}
@@ -350,17 +359,6 @@ func (u *UI) requireAuth(next http.HandlerFunc) http.HandlerFunc {
 		ctx := context.WithValue(r.Context(), ctxKey{}, sess.userID)
 		next(w, r.WithContext(ctx))
 	}
-}
-
-// clientIP extracts the client IP, honoring X-Forwarded-For (Traefik).
-func clientIP(r *http.Request) string {
-	if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
-		if i := strings.IndexByte(xff, ','); i >= 0 {
-			return strings.TrimSpace(xff[:i])
-		}
-		return strings.TrimSpace(xff)
-	}
-	return r.RemoteAddr
 }
 
 func (u *UI) handleLogin(w http.ResponseWriter, r *http.Request) {

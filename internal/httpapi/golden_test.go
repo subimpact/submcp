@@ -84,8 +84,11 @@ func (f *fakeKeyDB) ValidateAPIKey(_ context.Context, key string) (*db.APIKey, e
 // gateway, not the admin console).
 type fakeUIStore struct{}
 
-func (f *fakeUIStore) CountNamespaces(context.Context) (int, error) { return 0, nil }
-func (f *fakeUIStore) CountTools(context.Context) (int, error)      { return 0, nil }
+func (f *fakeUIStore) CountNamespaces(context.Context) (int, error)                { return 0, nil }
+func (f *fakeUIStore) CountTools(context.Context) (int, error)                     { return 0, nil }
+func (f *fakeUIStore) CountOperatorNamespaces(context.Context) (int, error)        { return 0, nil }
+func (f *fakeUIStore) CountOperatorTools(context.Context) (int, error)             { return 0, nil }
+func (f *fakeUIStore) ListOperatorServers(context.Context) ([]db.MCPServer, error) { return nil, nil }
 func (f *fakeUIStore) CreateAPIKey(context.Context, string, string, bool, *string) (*db.APIKey, error) {
 	return nil, nil
 }

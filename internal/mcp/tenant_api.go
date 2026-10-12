@@ -2,6 +2,7 @@ package mcp
 
 import (
 	"context"
+	"crypto/rand"
 	"crypto/sha256"
 	"crypto/subtle"
 	"encoding/json"
@@ -9,6 +10,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"regexp"
 	"strings"
 	"time"
@@ -261,7 +263,7 @@ func (t *tenantAPI) view(s db.MCPServer, toolCount int) tenantServerView {
 		Name:          s.Name,
 		URL:           deref(s.URL),
 		Type:          string(s.Type),
-		Headers:       MaskHeaders(s.Headers, t.box),
+		Headers:       MaskHeaders(s.Headers, t.box, deref(s.UserID), s.UUID),
 		ToolCount:     toolCount,
 		LastError:     s.LastError,
 		LastCheckedAt: s.LastCheckedAt,
@@ -357,13 +359,20 @@ func (t *tenantAPI) createServer(w http.ResponseWriter, r *http.Request) {
 		writeJSONError(w, http.StatusConflict, "tenant_not_provisioned", "This account has no endpoint yet. Contact support.")
 		return
 	}
-	sealed, err := t.sealHeaders(headers)
+	// The server UUID is chosen here, before sealing: each credential is bound
+	// to (owner, server uuid, header name), so the row must exist under that id.
+	id, err := newServerUUID()
+	if err != nil {
+		writeJSONError(w, http.StatusInternalServerError, "internal_error", "Database error")
+		return
+	}
+	sealed, err := t.sealHeaders(headers, c.UserID, id)
 	if err != nil {
 		writeJSONError(w, http.StatusServiceUnavailable, "credentials_unavailable", "Credential storage is not configured on this gateway.")
 		return
 	}
 
-	srv := db.MCPServer{Name: name, Type: typ, URL: &rawURL, Headers: sealed}
+	srv := db.MCPServer{UUID: id, Name: name, Type: typ, URL: &rawURL, Headers: sealed}
 	err = t.store.CreateTenantServer(r.Context(), c.UserID, nsUUID, &srv, t.maxServers)
 	switch {
 	case errors.Is(err, db.ErrTenantServerLimit):
@@ -453,8 +462,18 @@ func (t *tenantAPI) updateServer(w http.ResponseWriter, r *http.Request) {
 	}
 	if in.URL != nil {
 		rawURL := strings.TrimSpace(*in.URL)
-		if rawURL != deref(cur.URL) && !t.checkURL(w, r, rawURL) {
-			return
+		if rawURL != deref(cur.URL) {
+			// A change of scheme, host or port sends the stored credentials to
+			// another origin unless the caller supplies fresh values (masked
+			// placeholders do not count: they would replay the old secret).
+			if !sameOrigin(deref(cur.URL), rawURL) && (in.Headers == nil || anyMaskedHeader(*in.Headers)) {
+				writeJSONError(w, http.StatusBadRequest, "headers_required_for_new_origin",
+					"The host, scheme or port changed. Send the headers for the new server, with the full values (not masked ones), in the same request.")
+				return
+			}
+			if !t.checkURL(w, r, rawURL) {
+				return
+			}
 		}
 		next.URL = &rawURL
 	}
@@ -464,12 +483,12 @@ func (t *tenantAPI) updateServer(w http.ResponseWriter, r *http.Request) {
 			writeJSONError(w, http.StatusBadRequest, "invalid_headers", err.Error())
 			return
 		}
-		merged, err := t.mergeHeaders(plain, cur.Headers)
+		merged, err := t.mergeHeaders(plain, cur.Headers, c.UserID, cur.UUID)
 		if err != nil {
 			writeJSONError(w, http.StatusBadRequest, "invalid_headers", err.Error())
 			return
 		}
-		sealed, err := t.sealHeaders(merged)
+		sealed, err := t.sealHeaders(merged, c.UserID, cur.UUID)
 		if err != nil {
 			writeJSONError(w, http.StatusServiceUnavailable, "credentials_unavailable", "Credential storage is not configured on this gateway.")
 			return
@@ -536,11 +555,16 @@ func (t *tenantAPI) testServer(w http.ResponseWriter, r *http.Request) {
 		writeJSONError(w, http.StatusTooManyRequests, "rate_limited", "Too many tests. Wait a few seconds and try again.")
 		return
 	}
+	// Tests and refreshes count against the trial daily cap (P3): each one opens
+	// real upstream connections.
+	if !t.srv.tenants.allowToolCall(w, r, c.Tenant) {
+		return
+	}
 	row, ok := t.findServer(w, r, c)
 	if !ok {
 		return
 	}
-	ctx, cancel := context.WithTimeout(r.Context(), tenantUpstreamTimeout+5*time.Second)
+	ctx, cancel := context.WithTimeout(r.Context(), tenantRequestTimeout)
 	defer cancel()
 	n, err := t.srv.agg.RefreshServer(ctx, row.Server)
 	if err != nil {
@@ -683,18 +707,58 @@ func validTenantName(w http.ResponseWriter, name string) (string, bool) {
 	return name, true
 }
 
-// validTenantType accepts exactly the two remote transports. STDIO would run a
-// command on the gateway host and is never available to tenants.
+// validTenantType accepts only STREAMABLE_HTTP. The SSE transport needs a GET
+// handshake that the gateway does not implement yet, so tenants are not offered
+// it (SaaS phase 4b, #16). STDIO would run a command on the gateway host.
 func validTenantType(s string) (db.ServerType, error) {
 	switch s {
 	case "", string(db.ServerTypeStreamableHTTP):
 		return db.ServerTypeStreamableHTTP, nil
-	case string(db.ServerTypeSSE):
-		return db.ServerTypeSSE, nil
 	case string(db.ServerTypeStdio):
 		return "", errors.New("STDIO servers are not available to tenants")
 	}
-	return "", errors.New("type must be exactly STREAMABLE_HTTP or SSE")
+	return "", errors.New("type must be exactly STREAMABLE_HTTP")
+}
+
+// newServerUUID returns a random (version 4) UUID for a new tenant server.
+func newServerUUID() (string, error) {
+	var b [16]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		return "", err
+	}
+	b[6] = (b[6] & 0x0f) | 0x40
+	b[8] = (b[8] & 0x3f) | 0x80
+	return fmt.Sprintf("%x-%x-%x-%x-%x", b[0:4], b[4:6], b[6:8], b[8:10], b[10:16]), nil
+}
+
+// anyMaskedHeader reports whether any submitted header value is a mask.
+func anyMaskedHeader(in map[string]string) bool {
+	for _, v := range in {
+		if IsMaskedValue(v) {
+			return true
+		}
+	}
+	return false
+}
+
+// sameOrigin reports whether two https URLs share scheme, host and port. An
+// empty old URL (none stored) is never the same origin.
+func sameOrigin(oldURL, newURL string) bool {
+	a, errA := url.Parse(oldURL)
+	b, errB := url.Parse(newURL)
+	if errA != nil || errB != nil || oldURL == "" {
+		return false
+	}
+	return strings.EqualFold(a.Scheme, b.Scheme) &&
+		strings.EqualFold(a.Hostname(), b.Hostname()) &&
+		effectivePort(a) == effectivePort(b)
+}
+
+func effectivePort(u *url.URL) string {
+	if p := u.Port(); p != "" {
+		return p
+	}
+	return "443"
 }
 
 // validTenantHeaders checks a header map and returns it with canonical names.
@@ -754,19 +818,19 @@ func (t *tenantAPI) checkURL(w http.ResponseWriter, r *http.Request, raw string)
 	return true
 }
 
-// sealHeaders encrypts a header map for storage. An empty map is stored as {}
-// and needs no key.
-func (t *tenantAPI) sealHeaders(plain map[string]string) (json.RawMessage, error) {
+// sealHeaders encrypts a header map for storage, bound to its owner and server.
+// An empty map is stored as {} and needs no key.
+func (t *tenantAPI) sealHeaders(plain map[string]string, owner, serverUUID string) (json.RawMessage, error) {
 	if len(plain) == 0 {
 		return json.RawMessage(`{}`), nil
 	}
-	return SealHeaders(plain, t.box)
+	return SealHeaders(plain, t.box, owner, serverUUID)
 }
 
 // mergeHeaders resolves a submitted header map against the stored one: a masked
 // placeholder keeps the stored credential, anything else is taken as typed.
-func (t *tenantAPI) mergeHeaders(submitted map[string]string, stored json.RawMessage) (map[string]string, error) {
-	current, err := OpenSealedHeaders(stored, t.box)
+func (t *tenantAPI) mergeHeaders(submitted map[string]string, stored json.RawMessage, owner, serverUUID string) (map[string]string, error) {
+	current, err := OpenSealedHeaders(stored, t.box, owner, serverUUID)
 	if err != nil {
 		return nil, err
 	}

@@ -99,7 +99,10 @@ func subdomainSlug(host, baseHost string) string {
 	if baseHost == "" || host == "" {
 		return ""
 	}
-	host = strings.TrimSpace(host)
+	// DNS names are case-insensitive: "ACME.mcp..." is the tenant "acme". The
+	// comparison below must not depend on the client's capitalisation.
+	host = strings.ToLower(strings.TrimSpace(host))
+	baseHost = strings.ToLower(baseHost)
 	// Strip port (Host may be "slug.mcp.subimpact.net:443" behind proxies).
 	if i := strings.IndexByte(host, ':'); i >= 0 {
 		host = host[:i]

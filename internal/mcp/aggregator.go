@@ -156,6 +156,13 @@ func (a *Aggregator) ListTools(ctx context.Context, namespaceUUID string) ([]Too
 	if err != nil {
 		return nil, err
 	}
+	// Whole-request deadline for tenant fan-out (SaaS phase 4b, #2/#6): a slow
+	// or hostile upstream cannot hold the request past tenantRequestTimeout.
+	if hasTenantServer(servers) {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, tenantRequestTimeout)
+		defer cancel()
+	}
 
 	// Build/refresh the route map (also warms the tool cache).
 	if _, err := a.buildRouteMap(ctx, namespaceUUID, servers); err != nil {
@@ -382,6 +389,11 @@ func (a *Aggregator) CallTool(ctx context.Context, namespaceUUID, sessionID, too
 	if target.URL == nil || *target.URL == "" {
 		return nil, fmt.Errorf("server %q has no URL configured", target.Name)
 	}
+	if target.TenantManaged {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, tenantRequestTimeout)
+		defer cancel()
+	}
 
 	// Phase 4: a tenant tool disabled in this namespace is refused here too
 	// (tools/list already hides it). Operator servers keep their behaviour.
@@ -412,22 +424,18 @@ func (a *Aggregator) CallTool(ctx context.Context, namespaceUUID, sessionID, too
 		a.metrics.RecordFailure(target.UUID, b.State())
 		return nil, fmt.Errorf("server %q circuit open (breaker)", target.Name)
 	}
-	a.metrics.RecordCall(target.UUID, target.Name)
+	a.recordCall(*target)
 	a.metrics.RecordState(target.UUID, b.State())
 
-	client, err := a.pool.Acquire(ctx, sessionID, poolKey, func() (*UpstreamClient, error) {
-		c := NewUpstreamClient(cfg)
-		if err := c.Connect(ctx); err != nil {
-			return nil, err
-		}
-		return c, nil
-	})
+	client, err := a.acquire(ctx, *target, sessionID, poolKey, cfg)
 	if err != nil {
 		if b.Failure() {
 			a.quarantine(ctx, *target)
 		}
 		a.recordCheck(ctx, *target, cfg.Headers, err)
-		return nil, fmt.Errorf("acquire upstream %s: %w", target.Name, err)
+		// A connect error can echo the credential (an upstream 401 body often
+		// does). Redact it before it reaches the MCP client (PoC5).
+		return nil, redactError(fmt.Errorf("acquire upstream %s: %w", target.Name, err), secretsFor(*target, cfg))
 	}
 	defer a.pool.Release(sessionID, poolKey, client)
 
@@ -544,17 +552,11 @@ func (a *Aggregator) fetchServerTools(ctx context.Context, s db.MCPServer, overr
 		a.metrics.RecordFailure(s.UUID, b.State())
 		return nil, fmt.Errorf("server %q circuit open (breaker)", s.Name)
 	}
-	a.metrics.RecordCall(s.UUID, s.Name)
+	a.recordCall(s)
 	a.metrics.RecordState(s.UUID, b.State())
 	// Use a per-call session id (pool handles reuse).
 	sessionID := "list-" + s.UUID
-	client, err := a.pool.Acquire(ctx, sessionID, poolKey, func() (*UpstreamClient, error) {
-		c := NewUpstreamClient(cfg)
-		if err := c.Connect(ctx); err != nil {
-			return nil, err
-		}
-		return c, nil
-	})
+	client, err := a.acquire(ctx, s, sessionID, poolKey, cfg)
 	if err != nil {
 		if b.Failure() {
 			a.quarantine(ctx, s)
@@ -586,6 +588,8 @@ func (a *Aggregator) fetchServerTools(ctx context.Context, s db.MCPServer, overr
 // quarantine marks a server ERROR in the DB (removes it from the active
 // fan-out). Non-fatal: DB errors are logged, the breaker still protects.
 func (a *Aggregator) quarantine(ctx context.Context, s db.MCPServer) {
+	// Bookkeeping must survive the request deadline that caused the failure.
+	ctx = context.WithoutCancel(ctx)
 	if err := a.db.SetServerErrorStatus(ctx, s.UUID, db.ErrorStatusErr); err != nil {
 		slog.Warn("quarantine write failed", "server", s.Name, "err", err)
 		return
@@ -768,6 +772,46 @@ func (a *Aggregator) getServers(ctx context.Context, namespaceUUID string) ([]db
 	return servers, nil
 }
 
+// tenantRequestTimeout bounds one tenant tools/list or tools/call end to end
+// (SaaS phase 4b, #2): the fan-out, the waits for a tenant slot and the
+// upstream calls share it.
+var tenantRequestTimeout = 30 * time.Second // a variable only so tests can shorten it
+
+// hasTenantServer reports whether any server in the list is tenant-managed.
+func hasTenantServer(servers []db.MCPServer) bool {
+	for i := range servers {
+		if servers[i].TenantManaged {
+			return true
+		}
+	}
+	return false
+}
+
+// acquire obtains a connection for one server. Tenant servers draw on the
+// tenant budget and in-flight cap; operator servers use the legacy path.
+func (a *Aggregator) acquire(ctx context.Context, s db.MCPServer, sessionID, poolKey string, cfg UpstreamConfig) (*UpstreamClient, error) {
+	factory := func() (*UpstreamClient, error) {
+		c := NewUpstreamClient(cfg)
+		if err := c.Connect(ctx); err != nil {
+			return nil, err
+		}
+		return c, nil
+	}
+	if s.TenantManaged {
+		return a.pool.AcquireTenant(ctx, sessionID, poolKey, deref(s.UserID), factory)
+	}
+	return a.pool.Acquire(ctx, sessionID, poolKey, factory)
+}
+
+// recordCall counts one upstream call in the public metrics. Tenant upstreams
+// are not counted per server, so /metrics never names or ids a tenant row.
+func (a *Aggregator) recordCall(s db.MCPServer) {
+	if s.TenantManaged {
+		return
+	}
+	a.metrics.RecordCall(s.UUID, s.Name)
+}
+
 // SetTenantUpstreams wires the tenant credential box and strict network policy.
 // Call once at startup, before the aggregator serves requests.
 func (a *Aggregator) SetTenantUpstreams(box *SecretBox, policy *TenantNetPolicy) {
@@ -797,7 +841,7 @@ func (a *Aggregator) upstreamFor(s db.MCPServer) (UpstreamConfig, string, error)
 			Timeout:     60 * time.Second,
 		}, s.UUID, nil
 	}
-	if s.Type != db.ServerTypeStreamableHTTP && s.Type != db.ServerTypeSSE {
+	if s.Type != db.ServerTypeStreamableHTTP {
 		return UpstreamConfig{}, "", fmt.Errorf("server %q: type %s is not available to tenant servers", s.Name, s.Type)
 	}
 	if a.tenantPolicy == nil {
@@ -806,7 +850,7 @@ func (a *Aggregator) upstreamFor(s db.MCPServer) (UpstreamConfig, string, error)
 	if _, err := ValidateTenantURL(*s.URL, a.tenantPolicy); err != nil {
 		return UpstreamConfig{}, "", fmt.Errorf("server %q: %w", s.Name, err)
 	}
-	headers, err := OpenSealedHeaders(s.Headers, a.tenantBox)
+	headers, err := OpenSealedHeaders(s.Headers, a.tenantBox, deref(s.UserID), s.UUID)
 	if err != nil {
 		return UpstreamConfig{}, "", fmt.Errorf("server %q: %w", s.Name, err)
 	}
@@ -865,12 +909,16 @@ func (a *Aggregator) recordCheck(ctx context.Context, s db.MCPServer, headers ma
 	if !s.TenantManaged {
 		return
 	}
+	// The result must be stored even when the request deadline has passed.
+	ctx = context.WithoutCancel(ctx)
 	cs, ok := a.db.(serverCheckStore)
 	if !ok {
 		return
 	}
 	var msg *string
 	if err != nil {
+		// Redact first: truncating first could split a credential so that no
+		// full form remains to match (see redactSecrets).
 		m := truncate(redactSecrets(err.Error(), headers), 500)
 		msg = &m
 	}

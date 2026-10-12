@@ -53,8 +53,16 @@ func main() {
 	}
 	log.Printf("migrations applied")
 
+	// Trusted proxies (Traefik) decide which forwarded client address is believed.
+	if err := mcp.SetTrustedProxies(cfg.TrustedProxyCIDRs); err != nil {
+		log.Fatalf("%v", err)
+	}
+
 	// Wire the gateway.
 	pool := mcp.NewPool(cfg.MaxTotalConns, cfg.MaxConnsPerServer, 5*time.Minute)
+	// SaaS phase 4b (#2): tenants share a budget of the pool and a per-tenant
+	// in-flight cap, so operator acquires always have headroom.
+	pool.SetTenantLimits(cfg.TenantPoolBudget, cfg.TenantNamespaceInFlight)
 	// P1-3: SSRF guard — always block metadata/loopback; RFC1918 allowed
 	// per ALLOW_PRIVATE_UPSTREAMS (default ON self-hosted).
 	agg := mcp.NewAggregatorWithSSRF(pool, dbPool, mcp.NewSSRFGuard(cfg.AllowPrivateUpstreams))
@@ -69,13 +77,31 @@ func main() {
 		}
 		secretBox = box
 	}
-	agg.SetTenantUpstreams(secretBox, mcp.DefaultTenantNetPolicy())
+	// SaaS phase 4b (#11): the gateway's own names are never tenant upstreams.
+	agg.SetTenantUpstreams(secretBox, mcp.NewTenantNetPolicy(cfg.TenantBaseHost))
+	// SaaS phase 4b (boot): tenant credentials sealed under the v1 AAD are
+	// re-sealed to v2 before anything serves. A key that cannot open them stops
+	// the boot.
+	if secretBox != nil {
+		n, err := mcp.ResealLegacyTenantHeaders(ctx, dbPool, secretBox)
+		if err != nil {
+			log.Fatalf("tenant credential re-seal: %v", err)
+		}
+		if n > 0 {
+			log.Printf("re-sealed %d tenant server credential row(s) to the v2 AAD", n)
+		}
+	}
 	auth := mcp.NewAuth(dbPool)
 	srv := mcp.NewServer(dbPool, agg, pool, auth, cfg.SessionLifetime)
 	// SaaS Phase 1: tenant entitlement + trial usage cap. Enabled only when
 	// a tenant base host is configured; the legacy single-tenant deployment
 	// (no TENANT_BASE_HOST) keeps working untouched.
 	if cfg.TenantBaseHost != "" {
+		// SaaS phase 4b (P1 secrets): tenant mode always seals credentials, so a
+		// missing key stops the boot instead of failing each tenant request.
+		if cfg.TenantSecretKey == "" {
+			log.Fatalf("TENANT_SECRET_KEY is required when TENANT_BASE_HOST is set (tenant API enabled)")
+		}
 		srv.EnableTenants(dbPool, cfg.TenantBaseHost, cfg.TrialDailyLimit)
 		// SaaS Phase 4: tenant self-serve upstreams (public API with X-API-Key).
 		if err := srv.EnableTenantAPI(dbPool, mcp.TenantAPIConfig{
@@ -133,6 +159,10 @@ func main() {
 	// httpapi.BuildInternal and scripts/deploy-blue-green.sh).
 	var internalServer *http.Server
 	if cfg.TenantAPIServiceToken != "" && srv.TenantAPIEnabled() {
+		// SaaS phase 4b (#5): bind the internal docker network address only.
+		if err := config.ValidateInternalAddr(cfg.TenantAPIInternalAddr); err != nil {
+			log.Fatalf("%v", err)
+		}
 		internalServer = &http.Server{
 			Addr:              cfg.TenantAPIInternalAddr,
 			Handler:           httpapi.BuildInternal(logger, srv),

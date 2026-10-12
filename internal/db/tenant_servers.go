@@ -2,6 +2,7 @@ package db
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 
 	"github.com/jackc/pgx/v5"
@@ -26,6 +27,14 @@ var ErrTenantNameTaken = errors.New("tenant server name already in use")
 type TenantServerRow struct {
 	Server    MCPServer
 	ToolCount int
+}
+
+// TenantHeaderRow is one tenant server's stored header JSON with its owner. The
+// owner is part of the credential's associated data, so the re-seal needs it.
+type TenantHeaderRow struct {
+	ServerUUID  string
+	OwnerUserID string
+	Headers     json.RawMessage
 }
 
 // TenantToolRow is one discovered tool owned by a tenant, with its status in
@@ -91,7 +100,9 @@ func (p *Pool) ListTenantServers(ctx context.Context, userID string) ([]TenantSe
 // CreateTenantServer inserts a tenant-managed server and maps it into the
 // tenant's namespace in one transaction. A per-tenant advisory lock makes the
 // count check and the insert one decision, so concurrent creates cannot exceed
-// maxServers. On success s.UUID, s.CreatedAt and s.ErrorStatus are filled in.
+// maxServers. The caller may set s.UUID before the call (the credentials are
+// sealed to it); otherwise the database generates one. On success s.UUID,
+// s.CreatedAt and s.ErrorStatus are filled in.
 func (p *Pool) CreateTenantServer(ctx context.Context, userID, nsUUID string, s *MCPServer, maxServers int) error {
 	tx, err := p.Begin(ctx)
 	if err != nil {
@@ -111,10 +122,10 @@ func (p *Pool) CreateTenantServer(ctx context.Context, userID, nsUUID string, s 
 	}
 
 	err = tx.QueryRow(ctx, `
-		INSERT INTO mcp_servers (name, type, url, headers, user_id, tenant_managed)
-		VALUES ($1, $2, $3, $4, $5, true)
-		RETURNING uuid, created_at, error_status`,
-		s.Name, s.Type, s.URL, s.Headers, userID).Scan(&s.UUID, &s.CreatedAt, &s.ErrorStatus)
+		INSERT INTO mcp_servers (uuid, name, type, url, headers, user_id, tenant_managed)
+		VALUES (COALESCE(NULLIF($6::text, '')::uuid, gen_random_uuid()), $1, $2, $3, $4, $5, true)
+		RETURNING uuid::text, created_at, error_status`,
+		s.Name, s.Type, s.URL, s.Headers, userID, s.UUID).Scan(&s.UUID, &s.CreatedAt, &s.ErrorStatus)
 	if err != nil {
 		if isUniqueViolation(err) {
 			return ErrTenantNameTaken
@@ -165,11 +176,44 @@ func (p *Pool) DeleteTenantServer(ctx context.Context, userID, serverUUID string
 }
 
 // SetServerCheck records the outcome of the latest test or tools/list fetch.
-// A nil lastError means the check succeeded.
+// A nil lastError means the check succeeded. Only tenant-managed rows are
+// written: an operator row never takes a tenant check result.
 func (p *Pool) SetServerCheck(ctx context.Context, uuid string, lastError *string) error {
 	_, err := p.Exec(ctx, `
 		UPDATE mcp_servers SET last_error = $2, last_checked_at = now()
-		WHERE uuid = $1`, uuid, lastError)
+		WHERE uuid = $1 AND tenant_managed = true`, uuid, lastError)
+	return err
+}
+
+// ListLegacyTenantHeaders returns the tenant rows whose headers still hold v1
+// (header-name-only) ciphertext. Used once at boot by the re-seal.
+func (p *Pool) ListLegacyTenantHeaders(ctx context.Context) ([]TenantHeaderRow, error) {
+	rows, err := p.Query(ctx, `
+		SELECT uuid::text, user_id, headers
+		FROM mcp_servers
+		WHERE tenant_managed = true AND user_id IS NOT NULL
+		  AND headers::text LIKE '%enc:v1:%'
+		ORDER BY created_at`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []TenantHeaderRow
+	for rows.Next() {
+		var r TenantHeaderRow
+		if err := rows.Scan(&r.ServerUUID, &r.OwnerUserID, &r.Headers); err != nil {
+			return nil, err
+		}
+		out = append(out, r)
+	}
+	return out, rows.Err()
+}
+
+// SetTenantHeaders replaces the stored header JSON of one tenant row.
+func (p *Pool) SetTenantHeaders(ctx context.Context, serverUUID string, headers json.RawMessage) error {
+	_, err := p.Exec(ctx, `
+		UPDATE mcp_servers SET headers = $2
+		WHERE uuid = $1 AND tenant_managed = true`, serverUUID, headers)
 	return err
 }
 

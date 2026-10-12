@@ -1,6 +1,8 @@
 package config
 
 import (
+	"fmt"
+	"net"
 	"os"
 	"strconv"
 	"time"
@@ -24,7 +26,7 @@ type Config struct {
 	MCPMaxAttempts    int           // default 1
 	SessionLifetime   time.Duration // 0 = infinite
 	MaxTotalConns     int           // default 100
-	MaxConnsPerServer int           // default 5
+	MaxConnsPerServer int           // default 20
 
 	// Logging
 	LogLevel string
@@ -59,6 +61,37 @@ type Config struct {
 	TenantMaxServers int
 	// TenantTestPerMinute caps test/refresh calls per tenant per minute.
 	TenantTestPerMinute int
+	// TenantPoolBudget caps the upstream connections in use for tenants together
+	// (default 30% of MAX_TOTAL_CONNECTIONS), so operator acquires keep headroom.
+	TenantPoolBudget int
+	// TenantNamespaceInFlight caps concurrent tenant upstream acquires per
+	// tenant (default 4).
+	TenantNamespaceInFlight int
+	// TrustedProxyCIDRs lists the proxies whose X-Forwarded-For and
+	// CF-Connecting-IP headers are believed (the Traefik network). Empty trusts
+	// none, so the TCP peer is the client.
+	TrustedProxyCIDRs string
+}
+
+// ValidateInternalAddr refuses a service listener that would bind every
+// interface. The internal tenant API must bind the address of the internal
+// docker network only (TENANT_API_INTERNAL_ADDR=<ip>:<port>), so a second
+// network attached to the gateway cannot reach it.
+func ValidateInternalAddr(addr string) error {
+	host, port, err := net.SplitHostPort(addr)
+	if err != nil {
+		return fmt.Errorf("TENANT_API_INTERNAL_ADDR %q must be host:port", addr)
+	}
+	if port == "" {
+		return fmt.Errorf("TENANT_API_INTERNAL_ADDR %q has no port", addr)
+	}
+	if host == "" || host == "0.0.0.0" || host == "::" {
+		return fmt.Errorf("TENANT_API_INTERNAL_ADDR %q binds every interface; bind the submcp-internal address (for example 10.77.0.10:12013)", addr)
+	}
+	if net.ParseIP(host) == nil {
+		return fmt.Errorf("TENANT_API_INTERNAL_ADDR %q must use an IP address", addr)
+	}
+	return nil
 }
 
 func Get() *Config {
@@ -88,9 +121,13 @@ func Get() *Config {
 
 		TenantAPIServiceToken: getEnv("TENANT_API_SERVICE_TOKEN", ""),
 		TenantAPIInternalAddr: getEnv("TENANT_API_INTERNAL_ADDR", ":12013"),
-		TenantSecretKey:       getEnv("TENANT_SECRET_KEY", ""),
-		TenantMaxServers:      getEnvInt("TENANT_MAX_SERVERS", 10),
-		TenantTestPerMinute:   getEnvInt("TENANT_TEST_PER_MINUTE", 10),
+		// Unsafe defaults are refused by ValidateInternalAddr at startup.
+		TenantSecretKey:         getEnv("TENANT_SECRET_KEY", ""),
+		TenantMaxServers:        getEnvInt("TENANT_MAX_SERVERS", 10),
+		TenantTestPerMinute:     getEnvInt("TENANT_TEST_PER_MINUTE", 10),
+		TenantPoolBudget:        getEnvInt("TENANT_POOL_BUDGET", 30),
+		TenantNamespaceInFlight: getEnvInt("TENANT_NS_IN_FLIGHT", 4),
+		TrustedProxyCIDRs:       getEnv("TRUSTED_PROXY_CIDRS", ""),
 	}
 }
 

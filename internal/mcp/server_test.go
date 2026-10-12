@@ -288,8 +288,10 @@ func TestCORSActualRequest(t *testing.T) {
 	if got := rr.Header().Get("Access-Control-Allow-Origin"); got != "https://example.com" {
 		t.Fatalf("origin must be echoed on actual request, got %q", got)
 	}
-	if got := rr.Header().Get("Access-Control-Allow-Credentials"); got != "true" {
-		t.Fatalf("credentials must be allowed, got %q", got)
+	// SaaS phase 4b (P3): the gateway authenticates with API keys, not cookies,
+	// so no CORS credentials are granted.
+	if got := rr.Header().Get("Access-Control-Allow-Credentials"); got != "" {
+		t.Fatalf("credentials must not be allowed, got %q", got)
 	}
 }
 
@@ -321,9 +323,9 @@ func TestEndpointEnumerationStripsSensitive(t *testing.T) {
 // private keys only reach their own endpoints.
 func TestAuthScoping(t *testing.T) {
 	keys := map[string]*db.APIKey{
-		"pub-key":  {UserID: nil},
-		"x-key":    {UserID: strPtr("user-x")},
-		"y-key":    {UserID: strPtr("user-y")},
+		"pub-key": {UserID: nil},
+		"x-key":   {UserID: strPtr("user-x")},
+		"y-key":   {UserID: strPtr("user-y")},
 	}
 	fdb := &fakeKeyDB{keys: keys}
 	a := NewAuth(fdb)
