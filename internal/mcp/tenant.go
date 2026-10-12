@@ -50,7 +50,7 @@ func (g *tenantGate) checkEntitlement(w http.ResponseWriter, r *http.Request, t 
 		json.NewEncoder(w).Encode(map[string]any{
 			"error":             e.Reason,
 			"error_description": "Your subscription or trial has ended. Subscribe to keep using your gateway.",
-			"url":               "https://app.subimpact.net/billing",
+			"url":               "https://mcp.subimpact.net/dashboard",
 			"timestamp":         time.Now().UTC().Format(time.RFC3339),
 		})
 		return false
@@ -81,7 +81,7 @@ func (g *tenantGate) allowToolCall(w http.ResponseWriter, r *http.Request, t *db
 		json.NewEncoder(w).Encode(map[string]any{
 			"error":             "trial_limit_reached",
 			"error_description": "You've reached the daily trial limit. Subscribe to continue using your gateway.",
-			"url":               "https://app.subimpact.net/billing",
+			"url":               "https://mcp.subimpact.net/dashboard",
 			"timestamp":         time.Now().UTC().Format(time.RFC3339),
 		})
 		return false
