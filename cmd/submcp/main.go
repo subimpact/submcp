@@ -147,7 +147,11 @@ func main() {
 		accessVerifier = access.New(cfg.Access)
 		logger.Info("admin Cloudflare Access login enabled")
 	} else {
-		logger.Info("admin Cloudflare Access login disabled")
+		reason := "not_configured"
+		if cfg.Access.TeamDomain != "" && cfg.Access.AUD != "" && len(cfg.Access.AdminEmails) > 0 {
+			reason = "invalid_certs_url"
+		}
+		logger.Info("admin Cloudflare Access login disabled", "reason", reason)
 	}
 	adminUI := ui.NewWithAccess(dbPool, cfg.AdminIPAllowlist, accessVerifier)
 

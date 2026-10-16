@@ -427,7 +427,11 @@ func (u *UI) requireAuth(next http.HandlerFunc) http.HandlerFunc {
 		// carries its own token and is verified fresh (key material is
 		// cached inside the verifier). A verified JWT acts as the root
 		// operator admin, identical to an is_admin key login.
-		if tok := r.Header.Get(access.Header); tok != "" && u.access != nil && u.access.Ready() {
+		// Only for requests that reached us through the trusted reverse proxy
+		// (Traefik, behind Cloudflare): a JWT presented straight to a direct
+		// listener (127.0.0.1:12008, Tailscale) would skip Access revocation
+		// and the edge allowlist, so there the key login stays the only way in.
+		if tok := r.Header.Get(access.Header); tok != "" && u.access != nil && u.access.Ready() && mcp.PeerIsTrustedProxy(r) {
 			email, err := u.access.Verify(r.Context(), tok, time.Now())
 			if err != nil {
 				// err.Error() is a coarse reason category (bad_sig, expired,
@@ -715,6 +719,12 @@ func (u *UI) handleServerItem(w http.ResponseWriter, r *http.Request) {
 // handleServerTest performs a live initialize + tools/list against the
 // upstream to verify connectivity (used by the UI "Test" button).
 func (u *UI) handleServerTest(w http.ResponseWriter, r *http.Request, id string) {
+	// State-changing (outbound connect with stored credentials): POST only, so
+	// CrossOriginProtection covers it.
+	if r.Method != http.MethodPost {
+		writeJSON(w, http.StatusMethodNotAllowed, map[string]any{"error": "method_not_allowed"})
+		return
+	}
 	srv, err := u.db.GetServer(r.Context(), id, sessUserID(r))
 	if err != nil || srv == nil {
 		writeJSON(w, http.StatusNotFound, map[string]any{"error": "server_not_found"})

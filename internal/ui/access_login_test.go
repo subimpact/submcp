@@ -21,6 +21,7 @@ import (
 
 	"github.com/subimpact/submcp/internal/access"
 	"github.com/subimpact/submcp/internal/db"
+	"github.com/subimpact/submcp/internal/mcp"
 )
 
 // jwtRig serves a one-key JWKS document and mints RS256 tokens signed with a
@@ -37,6 +38,12 @@ type jwtRig struct {
 
 func newJWTRig(t *testing.T) *jwtRig {
 	t.Helper()
+	// httptest.NewRequest uses RemoteAddr 192.0.2.1: treat it as the reverse
+	// proxy, as Traefik is in production. The JWT path requires a trusted peer.
+	if err := mcp.SetTrustedProxies("192.0.2.1/32"); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = mcp.SetTrustedProxies("") })
 	k, err := rsa.GenerateKey(rand.Reader, 2048)
 	if err != nil {
 		t.Fatalf("rsa key: %v", err)
@@ -336,5 +343,33 @@ func TestCSRFSameOriginLoginWorks(t *testing.T) {
 	u.Handler().ServeHTTP(rr, req)
 	if rr.Code != http.StatusOK {
 		t.Fatalf("same-origin login = %d, want 200: %s", rr.Code, rr.Body.String())
+	}
+}
+
+// Review P2-1: a valid JWT presented straight to a direct listener (peer not
+// the trusted proxy: loopback, Tailscale) is ignored, so the key stays the
+// only way in there.
+func TestAccessJWTIgnoredFromUntrustedPeer(t *testing.T) {
+	r := newJWTRig(t)
+	u := NewWithAccess(&spyStore{}, "", r.ver)
+	for _, peer := range []string{"127.0.0.1:5555", "100.64.1.2:443"} {
+		rr := httptest.NewRecorder()
+		req := jwtAuth(r, httptest.NewRequest(http.MethodGet, "/api/admin/overview", nil), r.mint(t, time.Now(), nil))
+		req.RemoteAddr = peer
+		u.Handler().ServeHTTP(rr, req)
+		if rr.Code != http.StatusUnauthorized {
+			t.Fatalf("peer %s: status = %d, want 401", peer, rr.Code)
+		}
+	}
+}
+
+// Review P2-3: the server test endpoint is POST only (CSRF-covered).
+func TestServerTestRequiresPost(t *testing.T) {
+	r := newJWTRig(t)
+	u := NewWithAccess(&spyStore{}, "", r.ver)
+	rr := httptest.NewRecorder()
+	u.Handler().ServeHTTP(rr, jwtAuth(r, httptest.NewRequest(http.MethodGet, "/api/admin/servers/00000000-0000-0000-0000-000000000001/test", nil), r.mint(t, time.Now(), nil)))
+	if rr.Code != http.StatusMethodNotAllowed {
+		t.Fatalf("GET test: status = %d, want 405", rr.Code)
 	}
 }

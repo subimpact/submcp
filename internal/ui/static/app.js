@@ -95,7 +95,7 @@ $$(".tab").forEach((btn) => {
 async function loadOverview() {
   try {
     const data = await api("/api/admin/overview");
-    state = data;
+    state = { ...data, via: state.via, email: state.email };
     renderStats();
     renderOverviewServers();
     renderOverviewEndpoints();
@@ -445,7 +445,7 @@ async function toggleKey(uuid, wasActive) {
 (async () => {
   try {
     const data = await api("/api/admin/overview");
-    state = data;
+    state = { ...data, via: state.via, email: state.email };
     showMain("signed in");
     await whoami();
     renderStats();

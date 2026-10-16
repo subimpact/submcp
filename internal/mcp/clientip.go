@@ -100,6 +100,18 @@ func isTrustedProxy(ip net.IP) bool {
 	return false
 }
 
+// PeerIsTrustedProxy reports whether the request's TCP peer (RemoteAddr, never
+// a forwarded header) is one of TRUSTED_PROXY_CIDRS, i.e. the request came in
+// through the reverse proxy rather than a direct listener (loopback, Tailscale).
+func PeerIsTrustedProxy(r *http.Request) bool {
+	host, _, err := net.SplitHostPort(r.RemoteAddr)
+	if err != nil {
+		host = r.RemoteAddr
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && isTrustedProxy(ip)
+}
+
 // ClientIP returns the address to attribute a request to (rate limits and the
 // admin allowlist).
 func ClientIP(r *http.Request) string {
