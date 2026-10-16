@@ -62,3 +62,38 @@ func TestTrialEndedFlagOnlyForExpiredTrial(t *testing.T) {
 		t.Fatal("past_due must not set TrialEnded")
 	}
 }
+
+func TestEvaluateEntitlementSuspension(t *testing.T) {
+	now := time.Date(2026, 10, 12, 12, 0, 0, 0, time.UTC)
+	sus := now.Add(-time.Hour)
+	fut := now.Add(time.Hour)
+	cases := []struct {
+		name   string
+		tenant Tenant
+		reason string
+	}{
+		{"suspended active denies", Tenant{Status: TenantActive, SuspendedAt: &sus}, "account_suspended"},
+		{"suspended trialing denies", Tenant{Status: TenantTrialing, TrialEndsAt: &fut, SuspendedAt: &sus}, "account_suspended"},
+		{"suspended past_due denies", Tenant{Status: TenantPastDue, PastDueSince: &sus, SuspendedAt: &sus}, "account_suspended"},
+		{"suspended pending verification denies", Tenant{Status: TenantPendingVerification, SuspendedAt: &sus}, "account_suspended"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			e := EvaluateEntitlement(&c.tenant, now)
+			if !e.Denied || e.Reason != c.reason {
+				t.Fatalf("got denied=%v reason=%q, want account_suspended", e.Denied, e.Reason)
+			}
+		})
+	}
+
+	// Unsuspended behaves exactly as before (TrialEnded untouched, billing wins).
+	active := Tenant{Status: TenantActive, SuspendedAt: nil}
+	if e := EvaluateEntitlement(&active, now); e.Denied {
+		t.Fatal("unsuspended active must be allowed")
+	}
+	fut2 := now.Add(time.Hour)
+	tr := Tenant{Status: TenantTrialing, TrialEndsAt: &fut2}
+	if e := EvaluateEntitlement(&tr, now); e.Denied || e.TrialEnded {
+		t.Fatal("unsuspended trialing must be allowed")
+	}
+}

@@ -42,6 +42,10 @@ type Tenant struct {
 	SubscriptionEndsAt   *time.Time   `json:"subscription_ends_at"`
 	CanceledAt           *time.Time   `json:"canceled_at"`
 	PastDueSince         *time.Time   `json:"past_due_since"`
+	// SuspendedAt is operator-set suspension state (migration 0008), kept out
+	// of status so Stripe webhooks rewriting status cannot lift it.
+	SuspendedAt          *time.Time   `json:"suspended_at"`
+	SuspendedReason      *string      `json:"suspended_reason"`
 	CreatedAt            time.Time    `json:"created_at"`
 	UpdatedAt            time.Time    `json:"updated_at"`
 }
@@ -49,12 +53,13 @@ type Tenant struct {
 // tenantCols lists the tenants columns read by scanTenant, in order.
 const tenantCols = `id, user_id, slug, status, trial_ends_at, stripe_customer_id,
 	stripe_subscription_id, plan, subscription_ends_at, canceled_at,
-	past_due_since, created_at, updated_at`
+	past_due_since, suspended_at, suspended_reason, created_at, updated_at`
 
 func scanTenant(scan func(dest ...any) error, t *Tenant) error {
 	return scan(&t.ID, &t.UserID, &t.Slug, &t.Status, &t.TrialEndsAt,
 		&t.StripeCustomerID, &t.StripeSubscriptionID, &t.Plan, &t.SubscriptionEndsAt,
-		&t.CanceledAt, &t.PastDueSince, &t.CreatedAt, &t.UpdatedAt)
+		&t.CanceledAt, &t.PastDueSince, &t.SuspendedAt, &t.SuspendedReason,
+		&t.CreatedAt, &t.UpdatedAt)
 }
 
 // GetTenantByID returns a tenant row by UUID.
@@ -115,6 +120,9 @@ func (p *Pool) Entitlement(ctx context.Context, t *Tenant) (*TenantEntitlement, 
 }
 
 // EvaluateEntitlement is the access rule, kept pure so it can be tested:
+//   - suspended: denied with reason account_suspended (checked FIRST, before
+//     the billing status, so a suspended tenant cannot ride an active
+//     subscription or a running trial).
 //   - active   : allowed.
 //   - trialing : allowed while trial_ends_at is in the future.
 //   - past_due : allowed until past_due_since + PastDueGrace (3 days). A
@@ -127,6 +135,10 @@ func EvaluateEntitlement(t *Tenant, now time.Time) *TenantEntitlement {
 		e.Denied = true
 		e.Reason = reason
 		return e
+	}
+	// Admin suspension outranks every billing status (migration 0008).
+	if t.SuspendedAt != nil {
+		return deny("account_suspended")
 	}
 	switch t.Status {
 	case TenantActive:

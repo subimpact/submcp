@@ -29,7 +29,11 @@ func Build(logger *slog.Logger, srv *mcp.Server, adminUI *ui.UI) http.Handler {
 	// SaaS phase 4: tenant self-serve upstreams, X-API-Key auth only.
 	root.Handle("/api/tenant/", srv.TenantAPIHandler())
 
-	return withRequestLogging(logger, root)
+	var next http.Handler = root
+	if baseHost := srv.TenantBaseHost(); baseHost != "" {
+		next = blockAdminOnTenantHosts(baseHost, root)
+	}
+	return withRequestLogging(logger, next)
 }
 
 // BuildInternal assembles the service-only listener (TENANT_API_INTERNAL_ADDR).

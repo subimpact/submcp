@@ -285,6 +285,16 @@ func ctxTenant(r *http.Request) *db.Tenant {
 	return t
 }
 
+// TenantBaseHost reports the configured tenant base host ("" when tenant
+// mode is off). The root handler uses it to keep admin paths 404 on tenant
+// hosts (defence in depth, deploy-blue-green.sh carries the same Traefik rule).
+func (s *Server) TenantBaseHost() string {
+	if s == nil || s.tenants == nil {
+		return ""
+	}
+	return s.tenants.baseHost
+}
+
 // resolveTenantByOwner maps a bare-host request to the tenant that owns
 // the endpoint (used for entitlement checks on the admin-console path).
 // Legacy root endpoints (user_id NULL) return nil — not tenant-managed.

@@ -45,13 +45,18 @@ func (g *tenantGate) checkEntitlement(w http.ResponseWriter, r *http.Request, t 
 		return false
 	}
 	if e.Denied {
-		// An unconfirmed address is 403 (the account is not allowed yet); a
-		// billing or trial state is 402 (payment required).
+		// An unconfirmed address is 403 (the account is not allowed yet) and so
+		// is an operator suspension (migration 0008); a billing or trial state
+		// is 402 (payment required).
 		status := http.StatusPaymentRequired
 		desc := "Your subscription or trial has ended. Subscribe to keep using your gateway."
-		if e.Reason == "email_unverified" {
+		switch e.Reason {
+		case "email_unverified":
 			status = http.StatusForbidden
 			desc = "Confirm your email address to start your gateway. Check your inbox for the link."
+		case "account_suspended":
+			status = http.StatusForbidden
+			desc = "This account is suspended. Contact hello@m.subimpact.net."
 		}
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(status)
