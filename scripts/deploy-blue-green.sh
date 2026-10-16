@@ -93,6 +93,14 @@ fi
 # Per-tenant share of the pool (SaaS 4c, N2): at most 3 connections in use per
 # tenant, so 8 saturating tenants cannot take the whole tenant budget.
 : "${TENANT_NS_IN_FLIGHT:=3}"
+# R3: admin Cloudflare Access login, optional. NO :? guards here: any
+# missing setting disables JWT admin login (the API-key login stays), so a
+# deploy must never fail because of it. ACCESS_CERTS_URL is optional too;
+# when the team domain is set the default certs endpoint is derived from it.
+: "${ACCESS_TEAM_DOMAIN:=}"
+: "${ACCESS_AUD:=}"
+: "${ADMIN_EMAILS:=}"
+: "${ACCESS_CERTS_URL:=}"
 
 IMAGE="${1:-submcp:prod}"
 
@@ -262,6 +270,10 @@ TENANT_TEST_PER_MINUTE=$TENANT_TEST_PER_MINUTE
 TENANT_POOL_BUDGET=$TENANT_POOL_BUDGET
 TENANT_NS_IN_FLIGHT=$TENANT_NS_IN_FLIGHT
 TRUSTED_PROXY_CIDRS=$TRUSTED_PROXY_CIDRS
+ACCESS_TEAM_DOMAIN=$ACCESS_TEAM_DOMAIN
+ACCESS_AUD=$ACCESS_AUD
+ADMIN_EMAILS=$ADMIN_EMAILS
+ACCESS_CERTS_URL=$ACCESS_CERTS_URL
 ENVEOF
 
 # Create a gateway container with its uy2 address, attach the other networks,

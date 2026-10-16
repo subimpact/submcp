@@ -69,3 +69,51 @@ func TestValidateCIDRList(t *testing.T) {
 		}
 	}
 }
+
+// R3: the Cloudflare Access settings are optional everywhere. Missing env
+// must NOT fail Validate (self-hosted users run without Access) and must
+// leave the feature disabled via Access.Ready() == false. Present env loads
+// through access.Load semantics (trim, lowercase email list). Values used
+// here are fake test values.
+func TestCloudflareAccessConfigOptional(t *testing.T) {
+	// Nothing set: valid config, feature off.
+	t.Setenv("ACCESS_TEAM_DOMAIN", "")
+	t.Setenv("ACCESS_AUD", "")
+	t.Setenv("ADMIN_EMAILS", "")
+	t.Setenv("ACCESS_CERTS_URL", "")
+	c := Get()
+	if err := c.Validate(); err != nil {
+		t.Fatalf("empty Access env must validate: %v", err)
+	}
+	if c.Access.Ready() {
+		t.Fatal("empty Access env must not enable JWT login")
+	}
+
+	// All required names set: feature on, certs URL derived from the team.
+	t.Setenv("ACCESS_TEAM_DOMAIN", "  team.example.com ")
+	t.Setenv("ACCESS_AUD", " aud-app-3 ")
+	t.Setenv("ADMIN_EMAILS", " Admin@Example.com, other@example.com ")
+	c = Get()
+	if err := c.Validate(); err != nil {
+		t.Fatalf("configured Access must still validate: %v", err)
+	}
+	if !c.Access.Ready() {
+		t.Fatal("full Access env must enable JWT login")
+	}
+	if c.Access.AdminEmails[0] != "admin@example.com" {
+		t.Fatalf("emails = %v", c.Access.AdminEmails)
+	}
+	if c.Access.CertsURL != "https://team.example.com/cdn-cgi/access/certs" {
+		t.Fatalf("certs url = %q", c.Access.CertsURL)
+	}
+
+	// Partially configured: still valid, still off (fail closed).
+	t.Setenv("ACCESS_AUD", "")
+	c = Get()
+	if c.Access.Ready() {
+		t.Fatal("missing ACCESS_AUD must disable JWT login")
+	}
+	if err := c.Validate(); err != nil {
+		t.Fatalf("partial Access env must validate: %v", err)
+	}
+}

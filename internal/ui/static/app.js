@@ -6,7 +6,7 @@ const esc = (s) => String(s ?? "").replace(/[&<>"']/g, (c) => ({
   "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;",
 }[c]));
 
-let state = { servers: [], namespaces: [], endpoints: [], keys: [], mappings: {} };
+let state = { servers: [], namespaces: [], endpoints: [], keys: [], mappings: {}, via: null, email: null };
 let editingServer = null;
 let editingEndpoint = null;
 
@@ -36,6 +36,20 @@ function showMain(name) {
   $("#session-name").textContent = name || "";
 }
 
+// whoami records HOW the caller is signed in (R3). Cloudflare Access
+// callers show their verified email in the header and sign out by leaving
+// through Cloudflare, not through the session endpoint.
+async function whoami() {
+  try {
+    const w = await api("/api/admin/whoami");
+    state.via = w.via;
+    state.email = w.email;
+    if (w.via === "access" && w.email) {
+      $("#session-name").textContent = `Signed in as ${w.email} (Cloudflare Access)`;
+    }
+  } catch (_) {}
+}
+
 $("#login-form").addEventListener("submit", async (e) => {
   e.preventDefault();
   const key = $("#login-key").value.trim();
@@ -46,6 +60,8 @@ $("#login-form").addEventListener("submit", async (e) => {
       body: JSON.stringify({ key }),
     });
     showMain(res.name);
+    state.via = "session";
+    state.email = null;
     $("#login-key").value = "";
     await loadOverview();
   } catch (err) {
@@ -55,6 +71,10 @@ $("#login-form").addEventListener("submit", async (e) => {
 });
 
 $("#logout-btn").addEventListener("click", async () => {
+  if (state.via === "access") {
+    window.location.href = "/cdn-cgi/access/logout";
+    return;
+  }
   try { await api("/api/admin/logout", { method: "POST" }); } catch (_) {}
   showLogin();
 });
@@ -427,6 +447,7 @@ async function toggleKey(uuid, wasActive) {
     const data = await api("/api/admin/overview");
     state = data;
     showMain("signed in");
+    await whoami();
     renderStats();
     renderOverviewServers();
     renderOverviewEndpoints();

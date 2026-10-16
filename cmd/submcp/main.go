@@ -12,6 +12,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/subimpact/submcp/internal/access"
 	"github.com/subimpact/submcp/internal/config"
 	"github.com/subimpact/submcp/internal/db"
 	"github.com/subimpact/submcp/internal/httpapi"
@@ -135,7 +136,20 @@ func main() {
 
 	// Admin UI (embedded, mounted at /). P2-3: optional admin IP
 	// allowlist via ADMIN_IP_ALLOWLIST (empty = allow all).
-	adminUI := ui.NewWithAllowlist(dbPool, cfg.AdminIPAllowlist)
+	//
+	// R3: admin login via a verified Cloudflare Access JWT. All three
+	// required settings (ACCESS_TEAM_DOMAIN, ACCESS_AUD, ADMIN_EMAILS) must
+	// be present; anything missing leaves JWT login off and the API-key
+	// login as the only admin login. No deployment values are logged here:
+	// the team domain and aud tag stay in the env file.
+	var accessVerifier *access.Verifier
+	if cfg.Access.Ready() {
+		accessVerifier = access.New(cfg.Access)
+		logger.Info("admin Cloudflare Access login enabled")
+	} else {
+		logger.Info("admin Cloudflare Access login disabled")
+	}
+	adminUI := ui.NewWithAccess(dbPool, cfg.AdminIPAllowlist, accessVerifier)
 
 	// Root handler: gateway routes + admin UI, wrapped in request
 	// logging (P1-14). Assembled in internal/httpapi so tests drive the

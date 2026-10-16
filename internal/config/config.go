@@ -10,6 +10,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/subimpact/submcp/internal/access"
 )
 
 // Config holds all runtime configuration for submcp.
@@ -71,10 +73,17 @@ type Config struct {
 	// TenantNamespaceInFlight caps the connections in use per tenant (its share
 	// of the budget; default 3, SaaS 4c N2).
 	TenantNamespaceInFlight int
+
 	// TrustedProxyCIDRs lists the proxies whose X-Forwarded-For and
 	// CF-Connecting-IP headers are believed (the Traefik network). Empty trusts
 	// none, so the TCP peer is the client.
 	TrustedProxyCIDRs string
+
+	// Admin Cloudflare Access login (R3, optional). TeamDomain/AUD/AdminEmails
+	// must ALL be set for JWT login to be enabled; any missing member turns it
+	// off (Access.Ready()==false) and Validate never fails because of it, so
+	// self-hosted deployments without Access keep working unchanged.
+	Access access.Config
 }
 
 // ValidateInternalAddr refuses a service listener that would bind every
@@ -209,6 +218,11 @@ func Get() *Config {
 		TenantPoolBudget:        getEnvInt("TENANT_POOL_BUDGET", 30),
 		TenantNamespaceInFlight: getEnvInt("TENANT_NS_IN_FLIGHT", 3),
 		TrustedProxyCIDRs:       getEnv("TRUSTED_PROXY_CIDRS", ""),
+		// R3: Cloudflare Access admin login (optional). All semantics
+		// (trimming, lower-casing, default certs URL, scheme checks) live in
+		// access.Load; anything missing leaves Access.Ready() false, which
+		// disables JWT login without failing Validate.
+		Access: access.Load(os.Getenv),
 	}
 }
 

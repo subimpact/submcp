@@ -64,10 +64,37 @@ All configuration is via environment variables:
 | `TENANT_POOL_BUDGET` | `30` | Tenant connections in use across all tenants (30% of the pool) |
 | `TENANT_NS_IN_FLIGHT` | `3` | Connections in use per tenant (its share of the budget) |
 | `TRUSTED_PROXY_CIDRS` | none | Proxies whose `CF-Connecting-IP` and `X-Forwarded-For` are believed. The deploy script sets Traefik's exact address |
+| `ACCESS_TEAM_DOMAIN` | none | Cloudflare Access team domain (for example `example-team.cloudflareaccess.com`). Part of the optional admin Access login below |
+| `ACCESS_AUD` | none | Cloudflare Access application audience tag (aud). Part of the optional admin Access login below |
+| `ADMIN_EMAILS` | none | Comma-separated admin email allowlist for the Access login. Part of the optional admin Access login below |
+| `ACCESS_CERTS_URL` | derived | Optional override for the Access key set URL (default `https://<team domain>/cdn-cgi/access/certs`) |
 
 Startup validates the whole configuration before any listener is bound
 (`config.Validate`). A bad key, address, CIDR list or missing network stops the
 process with one error that lists every problem.
+
+## Admin behind Cloudflare Access (optional)
+
+If the admin page sits behind Cloudflare Access, the gateway can accept a
+verified Access JWT as an admin login. Set all three of `ACCESS_TEAM_DOMAIN`,
+`ACCESS_AUD` and `ADMIN_EMAILS`; any one missing disables the feature (the
+start log then shows one line: `admin Cloudflare Access login disabled`,
+nothing fails). Requests carrying a valid `Cf-Access-Jwt-Assertion` header
+from a allowlisted email are treated as the operator admin, so the dashboard
+opens without the API-key prompt. No session is created from a JWT: every
+request is verified fresh, and failures are logged only as a reason category,
+never the token or the rejected email.
+
+The API-key login always remains available and unchanged. Hermes and
+Tailscale reach the gateway on `127.0.0.1:12008` without Cloudflare in front
+(no Access header exists there), so the key stays the only way in on those
+paths. The admin API's state-changing methods (POST, PUT, PATCH, DELETE under
+`/api/admin/`) also refuse cross-site browser requests, while requests with
+no `Origin` or `Sec-Fetch-Site` headers (curl, scripts) keep working.
+
+`GET /api/admin/whoami` reports how the caller authenticated:
+`{"via":"session","email":null,"key_name":"..."}` for a key login or
+`{"via":"access","email":"...","key_name":null}` for an Access login.
 
 ## Tenant upstreams
 

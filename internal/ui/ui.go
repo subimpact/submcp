@@ -14,6 +14,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/subimpact/submcp/internal/access"
 	"github.com/subimpact/submcp/internal/db"
 	"github.com/subimpact/submcp/internal/mcp"
 )
@@ -61,9 +62,15 @@ type Store interface {
 //   - GET  /api/public/stats -> unauthenticated non-sensitive stats (landing page)
 //   - POST /api/admin/login    -> {key} -> sets session cookie
 //   - POST /api/admin/logout   -> clears session
+//   - GET  /api/admin/whoami   -> how the caller authenticated (R3)
 //   - GET  /api/admin/overview -> servers, namespaces, endpoints, keys, tools
 //   - CRUD /api/admin/servers|namespaces|endpoints|keys
 //   - POST /api/admin/servers/:uuid/test -> live connectivity check
+//
+// Admin login accepts either an is_admin API key (session cookie) or, when
+// configured (R3), a valid Cloudflare Access JWT in the Cf-Access-Jwt-Assertion
+// header; the admin API's state-changing methods reject cross-site browser
+// requests (http.CrossOriginProtection).
 type UI struct {
 	db       Store
 	sessions *sessionStore
@@ -71,6 +78,10 @@ type UI struct {
 
 	// P2-3: admin IP allowlist (empty = allow all).
 	adminAllowlist []*net.IPNet
+
+	// R3: optional Cloudflare Access verifier. nil = JWT login disabled;
+	// the API-key login is then the only admin login.
+	access *access.Verifier
 
 	// Public stats cache (A8): 60s TTL, avoids DB hits per landing page load.
 	statsMu    sync.Mutex
@@ -87,8 +98,17 @@ func New(dbPool Store) *UI {
 // (P2-3). allowlist is a comma-separated list of CIDRs or single IPs;
 // empty disables the restriction.
 func NewWithAllowlist(dbPool Store, allowlist string) *UI {
+	return NewWithAccess(dbPool, allowlist, nil)
+}
+
+// NewWithAccess creates the web UI handler with an admin IP allowlist and an
+// optional Cloudflare Access verifier (R3). A nil verifier, or one whose
+// config is not Ready, leaves JWT login disabled; the API-key login then
+// remains the only admin login (unchanged behaviour for self-hosted users).
+func NewWithAccess(dbPool Store, allowlist string, accessVerifier *access.Verifier) *UI {
 	u := New(dbPool)
 	u.adminAllowlist = parseAllowlist(allowlist)
+	u.access = accessVerifier
 	return u
 }
 
@@ -156,18 +176,26 @@ func (u *UI) Handler() http.Handler {
 	sub, _ := fs.Sub(staticFS, "static")
 	mux.Handle("/assets/", http.StripPrefix("/assets/", http.FileServer(http.FS(sub))))
 
-	// Admin API (auth required except login).
-	mux.HandleFunc("/api/admin/login", u.handleLogin)
-	mux.HandleFunc("/api/admin/logout", u.handleLogout)
-	mux.HandleFunc("/api/admin/overview", u.requireAuth(u.handleOverview))
-	mux.HandleFunc("/api/admin/servers", u.requireAuth(u.handleServers))
-	mux.HandleFunc("/api/admin/servers/", u.requireAuth(u.handleServerItem))
-	mux.HandleFunc("/api/admin/namespaces", u.requireAuth(u.handleNamespaces))
-	mux.HandleFunc("/api/admin/namespaces/", u.requireAuth(u.handleNamespaceItem))
-	mux.HandleFunc("/api/admin/endpoints", u.requireAuth(u.handleEndpoints))
-	mux.HandleFunc("/api/admin/endpoints/", u.requireAuth(u.handleEndpointItem))
-	mux.HandleFunc("/api/admin/keys", u.requireAuth(u.handleKeys))
-	mux.HandleFunc("/api/admin/keys/", u.requireAuth(u.handleKeyItem))
+	// Admin API (auth required except login; R3: the state-changing methods
+	// additionally refuse cross-site browser requests). The Cloudflare Access
+	// JWT is only ever read from access.Header (never the CF_Authorization
+	// cookie), and only when the feature is configured.
+	csrf := http.NewCrossOriginProtection()
+	adminAPI := func(h http.HandlerFunc) http.Handler {
+		return csrf.Handler(u.requireAuth(h))
+	}
+	mux.Handle("/api/admin/login", csrf.Handler(http.HandlerFunc(u.handleLogin)))
+	mux.Handle("/api/admin/logout", csrf.Handler(http.HandlerFunc(u.handleLogout)))
+	mux.Handle("/api/admin/whoami", adminAPI(u.handleWhoami))
+	mux.Handle("/api/admin/overview", adminAPI(u.handleOverview))
+	mux.Handle("/api/admin/servers", adminAPI(u.handleServers))
+	mux.Handle("/api/admin/servers/", adminAPI(u.handleServerItem))
+	mux.Handle("/api/admin/namespaces", adminAPI(u.handleNamespaces))
+	mux.Handle("/api/admin/namespaces/", adminAPI(u.handleNamespaceItem))
+	mux.Handle("/api/admin/endpoints", adminAPI(u.handleEndpoints))
+	mux.Handle("/api/admin/endpoints/", adminAPI(u.handleEndpointItem))
+	mux.Handle("/api/admin/keys", adminAPI(u.handleKeys))
+	mux.Handle("/api/admin/keys/", adminAPI(u.handleKeyItem))
 
 	// Admin SPA.
 	mux.HandleFunc("/admin/", func(w http.ResponseWriter, r *http.Request) {
@@ -343,21 +371,78 @@ func sessUserID(r *http.Request) *string {
 	return v
 }
 
+// authInfo is the resolved identity requireAuth puts into the request
+// context. It answers /api/admin/whoami and any logging that needs to know
+// HOW the caller authenticated (R3).
+//
+// userID keeps the session semantics: nil = legacy root operator. A JWT
+// admin gets nil too: an is_admin key that can be pasted into the login form
+// is always the root operator's own key (only root sessions can mint admin
+// keys, so every is_admin key has a nil user id), and nil grants exactly the
+// root operator rights (unscoped queries, admin-key minting). Anything else
+// would make the JWT login weaker or stronger than the key login it
+// replaces.
+type authInfo struct {
+	userID  *string // nil = legacy root operator
+	via     string  // "session" or "access"
+	email   string  // verified Access email (via = access only)
+	keyName string  // admin key name (via = session only)
+}
+
+const (
+	authViaSession = "session"
+	authViaAccess  = "access"
+)
+
+type authInfoKey struct{}
+
+// authFrom extracts the resolved identity from the request context.
+func authFrom(r *http.Request) authInfo {
+	v, _ := r.Context().Value(authInfoKey{}).(authInfo)
+	return v
+}
+
 func (u *UI) requireAuth(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		// P2-3: admin allowlist — check source IP before anything else.
+		// P2-3: admin allowlist — check source IP before any credential.
+		// Applies equally to cookie and JWT callers (unchanged).
 		if !u.allowlistAllows(mcp.ClientIP(r)) {
 			writeJSON(w, http.StatusForbidden, map[string]any{"error": "forbidden"})
 			return
 		}
-		c, err := r.Cookie(sessionCookie)
-		if err != nil || !u.sessions.valid(c.Value) {
-			writeJSON(w, http.StatusUnauthorized, map[string]any{"error": "unauthorized"})
-			return
+		// (b) Valid session cookie, exactly as before.
+		if c, err := r.Cookie(sessionCookie); err == nil && u.sessions.valid(c.Value) {
+			if sess, ok := u.sessions.lookup(c.Value); ok {
+				ctx := context.WithValue(r.Context(), authInfoKey{}, authInfo{
+					userID: sess.userID, via: authViaSession, keyName: sess.keyName,
+				})
+				ctx = context.WithValue(ctx, ctxKey{}, sess.userID)
+				next(w, r.WithContext(ctx))
+				return
+			}
 		}
-		sess, _ := u.sessions.lookup(c.Value)
-		ctx := context.WithValue(r.Context(), ctxKey{}, sess.userID)
-		next(w, r.WithContext(ctx))
+		// (c) R3: Cloudflare Access JWT login. Only when the feature is
+		// configured; only the Cf-Access-Jwt-Assertion header is read, never
+		// the CF_Authorization cookie. No session is created: every request
+		// carries its own token and is verified fresh (key material is
+		// cached inside the verifier). A verified JWT acts as the root
+		// operator admin, identical to an is_admin key login.
+		if tok := r.Header.Get(access.Header); tok != "" && u.access != nil && u.access.Ready() {
+			email, err := u.access.Verify(r.Context(), tok, time.Now())
+			if err != nil {
+				// err.Error() is a coarse reason category (bad_sig, expired,
+				// ...): never the token and never the rejected email.
+				slog.Warn("admin cloudflare access login refused", "reason", err.Error())
+			} else {
+				ctx := context.WithValue(r.Context(), authInfoKey{}, authInfo{
+					userID: nil, via: authViaAccess, email: email,
+				})
+				ctx = context.WithValue(ctx, ctxKey{}, (*string)(nil))
+				next(w, r.WithContext(ctx))
+				return
+			}
+		}
+		writeJSON(w, http.StatusUnauthorized, map[string]any{"error": "unauthorized"})
 	}
 }
 
@@ -406,6 +491,25 @@ func (u *UI) handleLogout(w http.ResponseWriter, r *http.Request) {
 		Name: sessionCookie, Value: "", Path: "/", HttpOnly: true, MaxAge: -1,
 	})
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
+}
+
+// handleWhoami reports HOW the caller authenticated (R3):
+//   - via "session": the pasted is_admin API key name, email null;
+//   - via "access": the verified Cloudflare Access email, key_name null.
+func (u *UI) handleWhoami(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		writeJSON(w, http.StatusMethodNotAllowed, map[string]any{"error": "method_not_allowed"})
+		return
+	}
+	info := authFrom(r)
+	resp := map[string]any{"via": info.via, "email": nil, "key_name": nil}
+	switch info.via {
+	case authViaAccess:
+		resp["email"] = info.email
+	case authViaSession:
+		resp["key_name"] = info.keyName
+	}
+	writeJSON(w, http.StatusOK, resp)
 }
 
 // maskServer strips the bearer token and masks header values before a server
