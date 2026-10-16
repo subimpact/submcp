@@ -44,10 +44,10 @@ type Tenant struct {
 	PastDueSince         *time.Time   `json:"past_due_since"`
 	// SuspendedAt is operator-set suspension state (migration 0008), kept out
 	// of status so Stripe webhooks rewriting status cannot lift it.
-	SuspendedAt          *time.Time   `json:"suspended_at"`
-	SuspendedReason      *string      `json:"suspended_reason"`
-	CreatedAt            time.Time    `json:"created_at"`
-	UpdatedAt            time.Time    `json:"updated_at"`
+	SuspendedAt     *time.Time `json:"suspended_at"`
+	SuspendedReason *string    `json:"suspended_reason"`
+	CreatedAt       time.Time  `json:"created_at"`
+	UpdatedAt       time.Time  `json:"updated_at"`
 }
 
 // tenantCols lists the tenants columns read by scanTenant, in order.

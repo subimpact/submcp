@@ -99,6 +99,21 @@ func TestAdminBlockedOnTenantHosts(t *testing.T) {
 	}
 }
 
+func TestAdminBlockedOnTenantHostVariants(t *testing.T) {
+	h := httpapi.Build(slog.New(slog.NewTextHandler(io.Discard, nil)), blockServer(t), ui.New(&fakeUIStore{}))
+	ts := httptest.NewServer(h)
+	defer ts.Close()
+	for _, host := range []string{"acme.mcp.subimpact.net.", "ACME.MCP.SUBIMPACT.NET", "acme.mcp.subimpact.net.:443", "a.b.mcp.subimpact.net"} {
+		t.Run(host, func(t *testing.T) {
+			resp := doWithHost(t, ts, "GET", "/admin/", host, "")
+			defer resp.Body.Close()
+			if resp.StatusCode != http.StatusNotFound {
+				t.Fatalf("%s: status = %d, want 404", host, resp.StatusCode)
+			}
+		})
+	}
+}
+
 func TestTenantHostStillServesEverythingElse(t *testing.T) {
 	h := httpapi.Build(slog.New(slog.NewTextHandler(io.Discard, nil)), blockServer(t), ui.New(&fakeUIStore{}))
 	ts := httptest.NewServer(h)

@@ -21,6 +21,9 @@ func isTenantHost(host, baseHost string) bool {
 	if i := strings.IndexByte(host, ':'); i >= 0 {
 		host = host[:i]
 	}
+	// A fully-qualified name with a trailing dot is the same host.
+	host = strings.TrimRight(host, ".")
+	baseHost = strings.TrimRight(baseHost, ".")
 	if host == baseHost || host == "www."+baseHost {
 		return false
 	}
